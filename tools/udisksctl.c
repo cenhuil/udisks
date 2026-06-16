@@ -629,7 +629,7 @@ handle_command_mount_unmount (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   if (is_mount)
     g_option_context_set_summary (o, "Mount a filesystem.");
   else
@@ -1096,6 +1096,35 @@ pack_binary_blob (const gchar *data,
   return g_variant_builder_end (&builder);
 }
 
+static gboolean
+has_crypttab_passphrase (UDisksBlock *block)
+{
+  GVariantIter iter;
+  const gchar *type;
+  GVariant *details;
+
+  g_variant_iter_init (&iter, udisks_block_get_configuration (block));
+  while (g_variant_iter_next (&iter, "(&s@a{sv})", &type, &details))
+    {
+      if (g_strcmp0 (type, "crypttab") == 0)
+        {
+          const gchar *passphrase_path;
+          if (g_variant_lookup (details, "passphrase-path", "^&ay", &passphrase_path) &&
+              strlen (passphrase_path) > 0 &&
+              !g_str_has_prefix (passphrase_path, "/dev"))
+            {
+              g_variant_unref (details);
+              return TRUE;
+            }
+          g_variant_unref (details);
+          return FALSE;
+        }
+      g_variant_unref (details);
+    }
+
+  return FALSE;
+}
+
 static gint
 handle_command_unlock_lock (gint        *argc,
                             gchar      **argv[],
@@ -1137,7 +1166,7 @@ handle_command_unlock_lock (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   if (is_unlock)
     g_option_context_set_summary (o, "Unlock an encrypted device.");
   else
@@ -1305,7 +1334,7 @@ handle_command_unlock_lock (gint        *argc,
   options = g_variant_builder_end (&builder);
   g_variant_ref_sink (options);
 
-  if (is_unlock && !opt_unlock_keyfile)
+  if (is_unlock && !opt_unlock_keyfile && !has_crypttab_passphrase (block))
     passphrase = read_passphrase ();
 
  try_again:
@@ -1339,10 +1368,17 @@ handle_command_unlock_lock (gint        *argc,
 
       cleartext_object = UDISKS_OBJECT (g_dbus_object_manager_get_object (udisks_client_get_object_manager (client),
                                                                           (cleartext_object_path)));
-      g_print ("Unlocked %s as %s.\n",
-               udisks_block_get_device (block),
-               udisks_block_get_device (udisks_object_get_block (cleartext_object)));
-      g_object_unref (cleartext_object);
+      if (cleartext_object != NULL)
+        {
+          g_print ("Unlocked %s as %s.\n",
+                   udisks_block_get_device (block),
+                   udisks_block_get_device (udisks_object_peek_block (cleartext_object)));
+          g_object_unref (cleartext_object);
+        }
+      else
+        {
+          g_print ("Unlocked %s.\n", udisks_block_get_device (block));
+        }
       g_free (cleartext_object_path);
     }
   else
@@ -1536,7 +1572,7 @@ handle_command_loop (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   if (is_setup)
     g_option_context_set_summary (o, "Set up a loop device.");
   else
@@ -1722,7 +1758,7 @@ handle_command_loop (gint        *argc,
                                                                           (resulting_object_path)));
       g_print ("Mapped file %s as %s.\n",
                opt_loop_file,
-               udisks_block_get_device (udisks_object_get_block (resulting_object)));
+               udisks_block_get_device (udisks_object_peek_block (resulting_object)));
       g_object_unref (resulting_object);
       g_free (resulting_object_path);
     }
@@ -1878,7 +1914,7 @@ handle_command_smart_simulate (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Set SMART data for drive.");
   g_option_context_add_main_entries (o,
                                      command_smart_simulate_entries,
@@ -2165,7 +2201,7 @@ handle_command_power_off (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Safely power off a drive.");
   g_option_context_add_main_entries (o,
                                      command_power_off_entries,
@@ -2318,7 +2354,7 @@ handle_command_power_off (gint        *argc,
   proxy = udisks_object_peek_drive (object);
   if (!proxy)
     {
-      g_printerr ("Error powering off drive: dbus interface not supported");
+      g_printerr ("Error powering off drive: dbus interface not supported\n");
       g_object_unref (object);
       goto out;
     }
@@ -2401,7 +2437,7 @@ handle_command_info (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Show information about an object.");
   g_option_context_add_main_entries (o, command_info_entries, NULL /* GETTEXT_PACKAGE*/);
 
@@ -2495,8 +2531,9 @@ handle_command_info (gint        *argc,
           if (drive != NULL)
             {
               const gchar *base;
-              base = g_strrstr (g_dbus_object_get_object_path (G_DBUS_OBJECT (object)), "/") + 1;
-              g_print ("%s \n", base);
+              base = strrchr (g_dbus_object_get_object_path (G_DBUS_OBJECT (object)), '/');
+              if (base != NULL)
+                g_print ("%s \n", base + 1);
             }
         }
       g_list_free_full (objects, g_object_unref);
@@ -2607,7 +2644,7 @@ handle_command_dump (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Show information about all objects.");
   g_option_context_add_main_entries (o, command_dump_entries, NULL /* GETTEXT_PACKAGE*/);
 
@@ -2819,6 +2856,7 @@ monitor_on_interface_proxy_properties_changed (GDBusObjectManagerClient *manager
       if (max_property_name_len < property_name_len)
         max_property_name_len = property_name_len;
     }
+  g_variant_iter_free (iter);
 
   value_column = ((max_property_name_len + 7) / 8) * 8 + 8;
   if (value_column < 24)
@@ -2848,6 +2886,7 @@ monitor_on_interface_proxy_properties_changed (GDBusObjectManagerClient *manager
       g_free (value_str);
       g_variant_unref (value);
     }
+  g_variant_iter_free (iter);
  out:
   ;
 }
@@ -2911,7 +2950,7 @@ handle_command_monitor (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Monitor changes to objects.");
   g_option_context_add_main_entries (o, command_monitor_entries, NULL /* GETTEXT_PACKAGE*/);
 
@@ -3055,7 +3094,7 @@ handle_command_status (gint        *argc,
   o = g_option_context_new (NULL);
   if (request_completion)
     g_option_context_set_ignore_unknown_options (o, TRUE);
-  g_option_context_set_help_enabled (o, FALSE);
+  g_option_context_set_help_enabled (o, !request_completion);
   g_option_context_set_summary (o, "Shows high-level status.");
   g_option_context_add_main_entries (o, command_status_entries, NULL /* GETTEXT_PACKAGE*/);
 
@@ -3238,7 +3277,6 @@ static void
 modify_argv0_for_command (gint *argc, gchar **argv[], const gchar *command)
 {
   gchar *s;
-  gchar *program_name;
 
   /* TODO:
    *  1. get a g_set_prgname() ?; or
@@ -3248,10 +3286,8 @@ modify_argv0_for_command (gint *argc, gchar **argv[], const gchar *command)
   g_assert (g_strcmp0 ((*argv)[1], command) == 0);
   remove_arg (1, argc, argv);
 
-  program_name = g_path_get_basename ((*argv)[0]);
   s = g_strdup_printf ("%s %s", (*argv)[0], command);
   (*argv)[0] = s;
-  g_free (program_name);
 }
 
 static gchar *
@@ -3347,7 +3383,7 @@ main (int argc,
 
  again:
   command = argv[1];
-  if (g_strcmp0 (command, "help") == 0)
+  if (g_strcmp0 (command, "help") == 0 || g_strcmp0 (command, "--help") == 0 || g_strcmp0 (command, "-h") == 0)
     {
       if (request_completion)
         {

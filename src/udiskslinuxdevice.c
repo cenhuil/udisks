@@ -93,6 +93,7 @@ udisks_linux_device_class_init (UDisksLinuxDeviceClass *klass)
 /* ---------------------------------------------------------------------------------------------------- */
 
 static gboolean probe_ata (UDisksLinuxDevice  *device,
+                           gboolean            force_probe,
                            GCancellable       *cancellable,
                            GError            **error);
 
@@ -140,6 +141,42 @@ udisks_linux_device_new_sync (GUdevDevice *udev_device, GUdevClient *udev_client
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+static gboolean
+device_is_ata (GUdevDevice *d)
+{
+  GUdevDevice *parent;
+
+  if (!g_udev_device_get_property_as_boolean (d, "ID_ATA") ||
+      g_udev_device_has_property (d, "ID_USB_TYPE") ||
+      g_udev_device_has_property (d, "ID_USB_DRIVER") ||
+      g_udev_device_has_property (d, "ID_USB_MODEL"))
+    return FALSE;
+
+  parent = g_udev_device_get_parent_with_subsystem (d, "usb", "usb_interface");
+  if (parent != NULL)
+    {
+      g_object_unref (parent);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+/**
+ * udisks_linux_device_is_ata:
+ * @device: A #UDisksLinuxDevice.
+ *
+ * Checks that the @device is a locally-attached ATA drive. Typically
+ * excludes USB connected devices that still do identify as ATA.
+ *
+ * Returns: %TRUE if @device is ATA, %FALSE otherwise.
+ */
+gboolean
+udisks_linux_device_is_ata (UDisksLinuxDevice *device)
+{
+  return device_is_ata (device->udev_device);
+}
+
 /**
  * udisks_linux_device_reprobe_sync:
  * @device: A #UDisksLinuxDevice.
@@ -170,13 +207,10 @@ udisks_linux_device_reprobe_sync (UDisksLinuxDevice  *device,
   /* Get IDENTIFY DEVICE / IDENTIFY PACKET DEVICE data for ATA devices */
   if (g_strcmp0 (g_udev_device_get_subsystem (device->udev_device), "block") == 0 &&
       g_strcmp0 (g_udev_device_get_devtype (device->udev_device), "disk") == 0 &&
-      g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA") &&
-      !g_udev_device_has_property (device->udev_device, "ID_USB_TYPE") &&
-      !g_udev_device_has_property (device->udev_device, "ID_USB_DRIVER") &&
-      !g_udev_device_has_property (device->udev_device, "ID_USB_MODEL") &&
+      device_is_ata (device->udev_device) &&
       !udisks_linux_device_is_mpath_device_path (device))
     {
-      if (!probe_ata (device, cancellable, error))
+      if (!probe_ata (device, FALSE, cancellable, error))
         goto out;
     }
   else
@@ -203,6 +237,7 @@ udisks_linux_device_reprobe_sync (UDisksLinuxDevice  *device,
        */
 
       /* TODO: shall we trigger uevent on all namespaces once NVME_EVENT=connected is received? */
+      bd_nvme_controller_info_free (device->nvme_ctrl_info);
       device->nvme_ctrl_info = bd_nvme_get_controller_info (device_file, error);
       if (!device->nvme_ctrl_info)
         {
@@ -221,6 +256,7 @@ udisks_linux_device_reprobe_sync (UDisksLinuxDevice  *device,
       udisks_linux_device_subsystem_is_nvme (device) &&
       device_file != NULL)
     {
+      bd_nvme_namespace_info_free (device->nvme_ns_info);
       device->nvme_ns_info = bd_nvme_get_namespace_info (device_file, error);
       if (!device->nvme_ns_info)
         goto out;
@@ -243,14 +279,14 @@ udisks_linux_device_reprobe_sync (UDisksLinuxDevice  *device,
           slave = g_udev_client_query_by_sysfs_path (udev_client, slaves[n]);
           if (slave != NULL)
             {
-              is_ata |= g_udev_device_get_property_as_boolean (slave, "ID_ATA");
+              is_ata |= device_is_ata (slave);
               g_object_unref (slave);
             }
           if (is_ata)
             break;
         }
       g_strfreev (slaves);
-      if (is_ata && !probe_ata (device, cancellable, error))
+      if (is_ata && !probe_ata (device, TRUE, cancellable, error))
         goto out;
     }
 
@@ -264,6 +300,7 @@ udisks_linux_device_reprobe_sync (UDisksLinuxDevice  *device,
 
 static gboolean
 probe_ata (UDisksLinuxDevice  *device,
+           gboolean            force_probe,
            GCancellable       *cancellable,
            GError            **error)
 {
@@ -272,6 +309,18 @@ probe_ata (UDisksLinuxDevice  *device,
   gint fd = -1;
   UDisksAtaCommandInput input = {0};
   UDisksAtaCommandOutput output = {0};
+
+  if (!force_probe
+#ifndef HAVE_UDEV_257
+      /* added in https://github.com/systemd/systemd/pull/34343,
+       * skip probing if present (e.g. backported)
+       */
+      && g_udev_device_has_property (device->udev_device, "ID_ATA_READ_LOOKAHEAD")
+#else
+      /* udev >= 257 carries everything we need, no need for explicit probing */
+#endif
+     )
+    return TRUE;
 
   device_file = g_udev_device_get_device_file (device->udev_device);
   fd = open (device_file, O_RDONLY|O_NONBLOCK);
@@ -282,7 +331,6 @@ probe_ata (UDisksLinuxDevice  *device,
                    device_file);
       goto out;
     }
-
 
   if (ioctl (fd, CDROM_GET_CAPABILITY, NULL) == -1)
     {
@@ -405,7 +453,7 @@ udisks_linux_device_read_sysfs_attr_as_int (UDisksLinuxDevice  *device,
   gchar *str;
 
   if ((str = udisks_linux_device_read_sysfs_attr (device, attr, error)))
-    ret = atoi (str);
+    ret = (gint) g_ascii_strtoll (str, NULL, 0);
   g_free (str);
 
   return ret;

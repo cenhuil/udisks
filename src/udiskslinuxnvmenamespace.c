@@ -34,7 +34,6 @@
 #include "udisksprivate.h"
 #include "udisksdaemonutil.h"
 #include "udiskslinuxprovider.h"
-#include "udisksdaemonutil.h"
 #include "udisksbasejob.h"
 #include "udiskssimplejob.h"
 #include "udisksthreadedjob.h"
@@ -316,6 +315,15 @@ format_ns_job_func (UDisksThreadedJob  *job,
         }
     }
 
+  if (g_cancellable_is_cancelled (cancellable))
+    {
+      g_set_error (error,
+                   UDISKS_ERROR,
+                   UDISKS_ERROR_CANCELLED,
+                   "Format namespace job was cancelled");
+      goto out;
+    }
+
   ret = TRUE;
 
  out:
@@ -403,10 +411,10 @@ handle_format_namespace (UDisksNVMeNamespace   *_ns,
                                                     /* Translators: Shown in authentication dialog when the user
                                                      * initiates a device self-test.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and
+                                                     * Do not translate $(device.name), it's a placeholder and
                                                      * will be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to format a namespace on $(drive)"),
+                                                    N_("Authentication is required to format a namespace on $(device.name)"),
                                                     invocation))
     goto out;
 
@@ -429,6 +437,7 @@ handle_format_namespace (UDisksNVMeNamespace   *_ns,
                                                                            UDISKS_OBJECT (object),
                                                                            "nvme-format-ns",
                                                                            caller_uid,
+                                                                           FALSE,
                                                                            format_ns_job_func,
                                                                            data,
                                                                            (GDestroyNotify) format_ns_job_func_done,

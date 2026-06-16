@@ -237,8 +237,11 @@ build_structure (UDisksDaemon *daemon,
 /**
  * udisks_linux_logical_volume_update:
  * @logical_volume: A #UDisksLinuxLogicalVolume.
- * @vg: LVM volume group
- * @lv: LVM logical volume
+ * @group_object: A #UDisksLinuxVolumeGroupObject.
+ * @lv_info: LVM logical volume info
+ * @meta_lv_info: LVM metadata logical volume info
+ * @all_lv_infos: All LVM logical volume infos in the volume group
+ * @needs_polling_ret: (out): Return location for whether polling is needed
  *
  * Updates the interface.
  */
@@ -593,6 +596,7 @@ handle_delete (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-delete",
                                                caller_uid,
+                                               FALSE,
                                                lvremove_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -669,6 +673,7 @@ handle_repair (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-repair",
                                                caller_uid,
+                                               FALSE,
                                                lvrepair_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -766,6 +771,7 @@ handle_rename (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-rename",
                                                caller_uid,
+                                               FALSE,
                                                lvrename_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -848,6 +854,7 @@ handle_resize (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-resize",
                                                caller_uid,
+                                               FALSE,
                                                lvresize_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -937,6 +944,7 @@ handle_activate (UDisksLogicalVolume *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-activate",
                                                caller_uid,
+                                               FALSE,
                                                lvactivate_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1005,6 +1013,7 @@ handle_deactivate (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-deactivate",
                                                caller_uid,
+                                               FALSE,
                                                lvdeactivate_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1074,6 +1083,7 @@ handle_create_snapshot (UDisksLogicalVolume   *_volume,
                                                UDISKS_OBJECT (object),
                                                "lvm-lvol-snapshot",
                                                caller_uid,
+                                               FALSE,
                                                lvsnapshot_create_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1134,6 +1144,7 @@ handle_cache_attach (UDisksLogicalVolume   *volume_,
                                                UDISKS_OBJECT (object),
                                                "lvm-lv-make-cache",
                                                caller_uid,
+                                               FALSE,
                                                lvcache_attach_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1143,7 +1154,7 @@ handle_cache_attach (UDisksLogicalVolume   *volume_,
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
                                              UDISKS_ERROR_FAILED,
-                                             N_("Error converting volume: %s"),
+                                             "Error converting volume: %s",
                                              error->message);
       g_clear_error (&error);
       goto out;
@@ -1185,6 +1196,7 @@ handle_cache_detach_or_split (UDisksLogicalVolume    *volume_,
                                                UDISKS_OBJECT (object),
                                                "lvm-lv-split-cache",
                                                caller_uid,
+                                               FALSE,
                                                lvcache_detach_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1194,13 +1206,16 @@ handle_cache_detach_or_split (UDisksLogicalVolume    *volume_,
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
                                              UDISKS_ERROR_FAILED,
-                                             N_("Error converting volume: %s"),
+                                             "Error converting volume: %s",
                                              error->message);
       g_clear_error (&error);
       goto out;
     }
 
-  udisks_logical_volume_complete_cache_split (volume_, invocation);
+  if (destroy)
+    udisks_logical_volume_complete_cache_detach (volume_, invocation);
+  else
+    udisks_logical_volume_complete_cache_split (volume_, invocation);
 out:
   g_clear_object (&object);
 

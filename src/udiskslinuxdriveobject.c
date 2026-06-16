@@ -248,7 +248,7 @@ udisks_linux_drive_object_constructed (GObject *_object)
   object->module_ifaces = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, g_object_unref);
 
   /* initial coldplug */
-  udisks_linux_drive_object_uevent (object, "add", object->devices->data);
+  udisks_linux_drive_object_uevent (object, UDISKS_UEVENT_ACTION_ADD, object->devices->data);
 
   /* compute the object path */
   vendor = g_strdup (udisks_drive_get_vendor (object->iface_drive));
@@ -505,7 +505,7 @@ udisks_linux_drive_object_get_block (UDisksLinuxDriveObject *object,
 
 static gboolean
 update_iface (UDisksObject                     *object,
-              const gchar                      *uevent_action,
+              UDisksUeventAction                uevent_action,
               UDisksObjectHasInterfaceFunc      has_func,
               UDisksObjectConnectInterfaceFunc  connect_func,
               UDisksObjectUpdateInterfaceFunc   update_func,
@@ -587,7 +587,7 @@ drive_connect (UDisksObject *object)
 
 static gboolean
 drive_update (UDisksObject   *object,
-              const gchar    *uevent_action,
+              UDisksUeventAction uevent_action,
               GDBusInterface *_iface)
 {
   UDisksLinuxDriveObject *drive_object = UDISKS_LINUX_DRIVE_OBJECT (object);
@@ -609,7 +609,8 @@ drive_ata_check (UDisksObject *object)
     goto out;
 
   device = drive_object->devices->data;
-  if (device->ata_identify_device_data != NULL || device->ata_identify_packet_device_data != NULL)
+  if (udisks_linux_device_is_ata (device) ||
+      device->ata_identify_device_data != NULL || device->ata_identify_packet_device_data != NULL)
     ret = TRUE;
 
  out:
@@ -624,7 +625,7 @@ drive_ata_connect (UDisksObject *object)
 
 static gboolean
 drive_ata_update (UDisksObject   *object,
-                  const gchar    *uevent_action,
+                  UDisksUeventAction uevent_action,
                   GDBusInterface *_iface)
 {
   UDisksLinuxDriveObject *drive_object = UDISKS_LINUX_DRIVE_OBJECT (object);
@@ -662,7 +663,7 @@ nvme_ctrl_connect (UDisksObject *object)
 
 static gboolean
 nvme_ctrl_update (UDisksObject   *object,
-                  const gchar    *uevent_action,
+                  UDisksUeventAction uevent_action,
                   GDBusInterface *_iface)
 {
   UDisksLinuxDriveObject *drive_object = UDISKS_LINUX_DRIVE_OBJECT (object);
@@ -690,7 +691,7 @@ nvme_fabrics_connect (UDisksObject *object)
 
 static gboolean
 nvme_fabrics_update (UDisksObject   *object,
-                     const gchar    *uevent_action,
+                     UDisksUeventAction uevent_action,
                      GDBusInterface *_iface)
 {
   UDisksLinuxDriveObject *drive_object = UDISKS_LINUX_DRIVE_OBJECT (object);
@@ -725,14 +726,14 @@ find_link_for_sysfs_path (UDisksLinuxDriveObject *object,
 /**
  * udisks_linux_drive_object_uevent:
  * @object: A #UDisksLinuxDriveObject.
- * @action: Uevent action or %NULL
+ * @action: uevent action
  * @device: A #UDisksLinuxDevice device object or %NULL if the device hasn't changed.
  *
  * Updates all information on interfaces on @drive.
  */
 void
 udisks_linux_drive_object_uevent (UDisksLinuxDriveObject *object,
-                                  const gchar            *action,
+                                  UDisksUeventAction      action,
                                   UDisksLinuxDevice      *device)
 {
   GList *link;
@@ -749,7 +750,7 @@ udisks_linux_drive_object_uevent (UDisksLinuxDriveObject *object,
   link = NULL;
   if (device != NULL)
     link = find_link_for_sysfs_path (object, g_udev_device_get_sysfs_path (device->udev_device));
-  if (g_strcmp0 (action, "remove") == 0)
+  if (action == UDISKS_UEVENT_ACTION_REMOVE)
     {
       if (link != NULL)
         {
@@ -833,7 +834,7 @@ udisks_linux_drive_object_uevent (UDisksLinuxDriveObject *object,
     }
   g_list_free_full (modules, g_object_unref);
 
-  if (g_strcmp0 (action, "reconfigure") == 0)
+  if (action == UDISKS_UEVENT_ACTION_RECONFIGURE)
     conf_changed = TRUE;
 
   if (conf_changed)
@@ -905,7 +906,7 @@ check_for_vpd (GUdevDevice *device)
   const gchar *path;
   const gchar *model;
 
-  g_return_val_if_fail (G_UDEV_IS_DEVICE (device), FALSE);
+  g_return_val_if_fail (G_UDEV_IS_DEVICE (device), NULL);
 
   /* order of preference: WWN_serial, WWN, Model_serial, serial, path */
   serial = g_udev_device_get_property (device, "ID_SERIAL");
@@ -1111,13 +1112,16 @@ udisks_linux_drive_object_housekeeping (UDisksLinuxDriveObject  *object,
                                         GCancellable            *cancellable,
                                         GError                 **error)
 {
+  UDisksDriveAta *iface_drive_ata = NULL;
+  UDisksNVMeController *iface_nvme_ctrl = NULL;
   UDisksLinuxDevice *device = NULL;
   gboolean ret = FALSE;
 
   /* ATA */
-  if (object->iface_drive_ata != NULL &&
-      udisks_drive_ata_get_smart_supported (object->iface_drive_ata) &&
-      udisks_drive_ata_get_smart_enabled (object->iface_drive_ata))
+  iface_drive_ata = udisks_object_get_drive_ata (UDISKS_OBJECT (object));
+  if (iface_drive_ata != NULL &&
+      udisks_drive_ata_get_smart_supported (iface_drive_ata) &&
+      udisks_drive_ata_get_smart_enabled (iface_drive_ata))
     {
       GError *local_error;
       gboolean nowakeup;
@@ -1132,37 +1136,45 @@ udisks_linux_drive_object_housekeeping (UDisksLinuxDriveObject  *object,
                    nowakeup);
 
       local_error = NULL;
-      if (!udisks_linux_drive_ata_refresh_smart_sync (UDISKS_LINUX_DRIVE_ATA (object->iface_drive_ata),
+      if (!udisks_linux_drive_ata_refresh_smart_sync (UDISKS_LINUX_DRIVE_ATA (iface_drive_ata),
                                                       nowakeup,
                                                       NULL, /* simulate_path */
                                                       cancellable,
                                                       &local_error))
         {
-          if (nowakeup && (local_error->domain == UDISKS_ERROR &&
-                           local_error->code == UDISKS_ERROR_WOULD_WAKEUP))
+          if (nowakeup && g_error_matches (local_error, UDISKS_ERROR, UDISKS_ERROR_WOULD_WAKEUP))
             {
               udisks_info ("Drive %s is in a sleep state",
                            g_dbus_object_get_object_path (G_DBUS_OBJECT (object)));
               g_clear_error (&local_error);
             }
-          else if (nowakeup && (local_error->domain == UDISKS_ERROR &&
-                                local_error->code == UDISKS_ERROR_DEVICE_BUSY))
+          else if (nowakeup && g_error_matches (local_error, UDISKS_ERROR, UDISKS_ERROR_DEVICE_BUSY))
             {
               /* typically because a "secure erase" operation is pending */
               udisks_info ("Drive %s is busy",
                            g_dbus_object_get_object_path (G_DBUS_OBJECT (object)));
               g_clear_error (&local_error);
             }
+          else if (g_error_matches (local_error, UDISKS_ERROR, UDISKS_ERROR_CANCELLED))
+            {
+              /* typically because the device indicates it refuses any I/O intentionally */
+              udisks_info ("Drive %s is refusing any I/O intentionally",
+                           g_dbus_object_get_object_path (G_DBUS_OBJECT (object)));
+              g_clear_error (&local_error);
+            }
           else
             {
+              /* all other errors are reported within the BD_SMART_ERROR domain */
               g_propagate_prefixed_error (error, local_error, "Error updating SMART data: ");
               goto out;
             }
         }
     }
+
   /* NVMe */
-  if (object->iface_nvme_ctrl != NULL &&
-      g_strcmp0 (udisks_nvme_controller_get_state (UDISKS_NVME_CONTROLLER (object->iface_nvme_ctrl)), "live") == 0)
+  iface_nvme_ctrl = udisks_object_get_nvme_controller (UDISKS_OBJECT (object));
+  if (iface_nvme_ctrl != NULL &&
+      g_strcmp0 (udisks_nvme_controller_get_state (iface_nvme_ctrl), "live") == 0)
     {
       GError *local_error = NULL;
 
@@ -1175,7 +1187,7 @@ udisks_linux_drive_object_housekeeping (UDisksLinuxDriveObject  *object,
           udisks_info ("Refreshing Health Information on %s",
                        g_dbus_object_get_object_path (G_DBUS_OBJECT (object)));
 
-          if (!udisks_linux_nvme_controller_refresh_smart_sync (UDISKS_LINUX_NVME_CONTROLLER (object->iface_nvme_ctrl),
+          if (!udisks_linux_nvme_controller_refresh_smart_sync (UDISKS_LINUX_NVME_CONTROLLER (iface_nvme_ctrl),
                                                                 cancellable, &local_error))
             {
               g_propagate_prefixed_error (error, local_error, "Error updating Health Information: ");
@@ -1188,6 +1200,8 @@ udisks_linux_drive_object_housekeeping (UDisksLinuxDriveObject  *object,
 
  out:
   g_clear_object (&device);
+  g_clear_object (&iface_drive_ata);
+  g_clear_object (&iface_nvme_ctrl);
   return ret;
 }
 
@@ -1223,7 +1237,7 @@ is_block_unlocked (GList *objects, const gchar *crypto_object_path)
  * Checks if the drive represented by @object is in use and sets
  * @error if so.
  *
- * Returns: %TRUE if @object is not is use, %FALSE if @error is set.
+ * Returns: %TRUE if @object is not in use, %FALSE if @error is set.
  */
 gboolean
 udisks_linux_drive_object_is_not_in_use (UDisksLinuxDriveObject  *object,
@@ -1345,4 +1359,93 @@ udisks_linux_drive_object_get_siblings (UDisksLinuxDriveObject *object)
   g_list_free_full (objects, g_object_unref);
   g_free (sibling_id);
   return ret;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+/**
+ * udisks_linux_drive_object_nvme_subsys_uevent:
+ * @object: A #UDisksLinuxDriveObject.
+ * @action: uevent action
+ * @device: A #UDisksLinuxDevice device object or %NULL if the device hasn't changed.
+ * @subsystem_blocks: (element-type UDisksLinuxBlockObject) (array zero-terminated=1): A %NULL-terminated list of #UDisksLinuxBlockObject in the subsystem.
+ *
+ * Process uevent related to a NVMe subsystem the drive/controller is a part of.
+ */
+void
+udisks_linux_drive_object_nvme_subsys_uevent (UDisksLinuxDriveObject  *object,
+                                              UDisksUeventAction       action,
+                                              UDisksLinuxDevice       *device,
+                                              UDisksLinuxBlockObject **subsystem_blocks)
+{
+  if (object->iface_drive != NULL)
+    udisks_linux_drive_update (UDISKS_LINUX_DRIVE (object->iface_drive), object);
+  if (object->iface_nvme_ctrl != NULL)
+    udisks_linux_nvme_controller_update (UDISKS_LINUX_NVME_CONTROLLER (object->iface_nvme_ctrl), object);
+  if (object->iface_nvme_fabrics != NULL)
+    udisks_linux_nvme_fabrics_update (UDISKS_LINUX_NVME_FABRICS (object->iface_nvme_fabrics), object);
+
+  /* For controllers that don't report size_total, recalculate the drive size
+   * from the authoritative subsystem blocks list rather than relying on
+   * udisks block object lookup which is subject to race conditions.
+   * Filter namespaces per-controller using sysfs parentage when possible,
+   * falling back to all subsystem blocks for transports where blocks are
+   * not children of the controller (e.g. nvme-loop). */
+  if (object->iface_drive != NULL && subsystem_blocks != NULL)
+    {
+      UDisksLinuxDevice *ctrl_device;
+
+      ctrl_device = udisks_linux_drive_object_get_device (object, TRUE);
+      if (ctrl_device != NULL)
+        {
+          if (ctrl_device->nvme_ctrl_info != NULL &&
+              ctrl_device->nvme_ctrl_info->size_total == 0)
+            {
+              const gchar *ctrl_sysfs_path;
+              gsize ctrl_path_len;
+              UDisksLinuxBlockObject **b;
+              guint64 size = 0;
+              guint64 size_all = 0;
+              gboolean have_prefix_match = FALSE;
+
+              ctrl_sysfs_path = g_udev_device_get_sysfs_path (ctrl_device->udev_device);
+              ctrl_path_len = strlen (ctrl_sysfs_path);
+
+              for (b = subsystem_blocks; *b != NULL; b++)
+                {
+                  UDisksLinuxDevice *blk_device = udisks_linux_block_object_get_device (*b);
+                  if (blk_device != NULL)
+                    {
+                      if (blk_device->nvme_ns_info != NULL &&
+                          blk_device->nvme_ns_info->current_lba_format.data_size > 0)
+                        {
+                          guint64 ns_size;
+
+                          ns_size = (guint64) blk_device->nvme_ns_info->nsize *
+                                    ((guint64) blk_device->nvme_ns_info->current_lba_format.data_size +
+                                     (guint64) blk_device->nvme_ns_info->current_lba_format.metadata_size);
+                          size_all += ns_size;
+                          /* Block devices are typically children of their NVMe controller
+                           * in sysfs. Filter per-controller using sysfs parentage to handle
+                           * "isolated islands" within a subsystem. */
+                          if (g_str_has_prefix (g_udev_device_get_sysfs_path (blk_device->udev_device), ctrl_sysfs_path) &&
+                              g_udev_device_get_sysfs_path (blk_device->udev_device)[ctrl_path_len] == '/')
+                            {
+                              size += ns_size;
+                              have_prefix_match = TRUE;
+                            }
+                        }
+                      g_object_unref (blk_device);
+                    }
+                }
+              /* For transports where block devices are not children of their
+               * controller in sysfs (e.g. nvme-loop, blocks live under
+               * nvme-subsystem), fall back to using all blocks in the subsystem. */
+              if (!have_prefix_match)
+                size = size_all;
+              udisks_drive_set_size (UDISKS_DRIVE (object->iface_drive), size);
+            }
+          g_object_unref (ctrl_device);
+        }
+    }
 }

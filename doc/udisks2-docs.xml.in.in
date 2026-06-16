@@ -9,7 +9,7 @@
     <releaseinfo>
       For version &version; — the latest version of this
       documentation can be found at <ulink role="online-location"
-      url="http://storaged.org/doc/udisks2-api/latest/">http://storaged.org/doc/udisks2-api/latest/</ulink>.
+      url="https://storaged.org/udisks/docs/">https://storaged.org/udisks/docs/</ulink>.
     </releaseinfo>
   </bookinfo>
 
@@ -231,6 +231,10 @@
               <row>
                 <entry><parameter>device</parameter></entry>
                 <entry>If the object is a block device, this property is set to the value of the <link linkend="gdbus-property-org-freedesktop-UDisks2-Block.PreferredDevice">Block:PreferredDevice</link> property. If set, this is guaranteed to be a device file, for example <quote>/dev/vg_lucifer/lv_root</quote> or <quote>/dev/sda1</quote>. If the object is not a block device, this is not set.</entry>
+              </row>
+              <row>
+                <entry><parameter>device.name</parameter></entry>
+                <entry>The value of this property is set to the best display name for this device, which may be the device's <link linkend="gdbus-property-org-freedesktop-UDisks2-Block.IdLabel">Block:IdLabel</link>, or the capacity name calculated from the partition size, or the name associated with the encrypted volume. If none of the above information is present, the data assigned to the <parameter>drive</parameter> will be used as the fallback solution.</entry>
               </row>
               <row>
                 <entry><parameter>drive</parameter></entry>

@@ -30,14 +30,7 @@
       version: "7"
       reason: "SCSI debug bug causing kernel panic on CentOS/RHEL 7"
 
-- test: test_80_filesystem.EXFATTestCase.test_uuid
+- test: test_80_filesystem.NTFS3TestCase.test_mount_auto_configurable_mount_options
   skip_on:
     - distro: "fedora"
-      version: ["39", "40", "41"]
-      reason: Setting UUID with LC_ALL=C.UTF-8 is broken with recent exfatprogs
-
-- test: test_20_LVM.UdisksLVMVDOTest
-  skip_on:
-    - distro: "centos"
-      version: "10"
-      reason: "vdo userspace tools are not yet available on RHEL/CentOS 10"
+      reason: "udev now rejects properties with colon which we use for the mount options configuration"

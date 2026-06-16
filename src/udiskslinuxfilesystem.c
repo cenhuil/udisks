@@ -372,7 +372,7 @@ udisks_linux_filesystem_update (UDisksLinuxFilesystem  *filesystem,
   g_ptr_array_add (p, NULL);
   udisks_filesystem_set_mount_points (UDISKS_FILESYSTEM (filesystem),
                                       (const gchar *const *) p->pdata);
-  mounted = p->len > 0;
+  mounted = p->len > 1;
   g_ptr_array_free (p, TRUE);
   g_list_free_full (mounts, g_object_unref);
 
@@ -705,7 +705,6 @@ calculate_mount_point (UDisksDaemon  *daemon,
   gboolean fs_shared = FALSE;
   const gchar *label = NULL;
   const gchar *uuid = NULL;
-  gchar *escaped_user_name = NULL;
   gchar *mount_dir = NULL;
   gchar *mount_point = NULL;
   gchar *orig_mount_point;
@@ -802,25 +801,27 @@ calculate_mount_point (UDisksDaemon  *daemon,
 
   /* ... then uniqify the mount point */
   orig_mount_point = g_strdup (mount_point);
-  n = 1;
-  while (TRUE)
+  for (n = 1; g_file_test (mount_point, G_FILE_TEST_EXISTS) && n <= 1000; n++)
     {
-      if (!g_file_test (mount_point, G_FILE_TEST_EXISTS))
-        {
-          break;
-        }
-      else
-        {
-          g_free (mount_point);
-          mount_point = g_strdup_printf ("%s%u", orig_mount_point, n++);
-        }
+      g_free (mount_point);
+      mount_point = g_strdup_printf ("%s%u", orig_mount_point, n);
     }
   g_free (orig_mount_point);
+  if (n > 1000)
+    {
+      g_set_error (error,
+                   UDISKS_ERROR,
+                   UDISKS_ERROR_FAILED,
+                   "Too many mount points with prefix `%s'",
+                   mount_point);
+      g_free (mount_point);
+      mount_point = NULL;
+      goto out;
+    }
 
  out:
   g_free (mount_dir);
   g_clear_object (&object);
-  g_free (escaped_user_name);
   return mount_point;
 }
 
@@ -918,6 +919,7 @@ handle_mount_fstab (UDisksDaemon          *daemon,
   const gchar *message = NULL;
   gboolean success = FALSE;
   gboolean mount_fstab_as_root = FALSE;
+  gboolean dir_created = FALSE;
   UDisksBaseJob *job = NULL;
   GError *error = NULL;
 
@@ -933,10 +935,10 @@ handle_mount_fstab (UDisksDaemon          *daemon,
       /* Translators: Shown in authentication dialog when the user
        * requests mounting a filesystem.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to mount $(drive)");
+      message = N_("Authentication is required to mount $(device.name)");
       if (mount_other_user)
         {
           action_id = "org.freedesktop.udisks2.filesystem-mount-other-user";
@@ -975,6 +977,7 @@ handle_mount_fstab (UDisksDaemon          *daemon,
                                                  device);
           return FALSE;
         }
+      dir_created = TRUE;
     }
 
   while (TRUE)
@@ -983,6 +986,7 @@ handle_mount_fstab (UDisksDaemon          *daemon,
                                              UDISKS_OBJECT (object),
                                              "filesystem-mount",
                                              mount_fstab_as_root ? 0 : caller_uid,
+                                             FALSE,
                                              NULL /* cancellable */);
 
       /* XXX: using run_as_uid for root doesn't work even if the caller is already root */
@@ -1019,24 +1023,30 @@ handle_mount_fstab (UDisksDaemon          *daemon,
                * user requests mounting a filesystem that is in
                * /etc/fstab file with the x-udisks-auth option.
                *
-               * Do not translate $(drive), it's a
+               * Do not translate $(device.name), it's a
                * placeholder and will be replaced by the name of
                * the drive/device in question
                *
                * Do not translate /etc/fstab
                */
-              message = N_("Authentication is required to mount $(drive) referenced in the /etc/fstab file");
+              message = N_("Authentication is required to mount $(device.name) referenced in the /etc/fstab file");
               if (!udisks_daemon_util_check_authorization_sync (daemon,
                                                                 object,
                                                                 action_id,
                                                                 options,
                                                                 message,
                                                                 invocation))
-                return FALSE;
+                {
+                  if (dir_created && g_rmdir (mount_point_to_use) != 0)
+                    udisks_warning ("Error removing directory %s: %m", mount_point_to_use);
+                  return FALSE;
+                }
               mount_fstab_as_root = TRUE;
               continue;  /* retry */
             }
 
+          if (dir_created && g_rmdir (mount_point_to_use) != 0)
+            udisks_warning ("Error removing directory %s: %m", mount_point_to_use);
           g_dbus_method_invocation_return_error (invocation,
                                                  UDISKS_ERROR,
                                                  UDISKS_ERROR_FAILED,
@@ -1124,10 +1134,10 @@ handle_mount_dynamic (UDisksDaemon          *daemon,
   /* Translators: Shown in authentication dialog when the user
    * requests mounting a filesystem.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to mount $(drive)");
+  message = N_("Authentication is required to mount $(device.name)");
   if (mount_other_user)
     {
       action_id = "org.freedesktop.udisks2.filesystem-mount-other-user";
@@ -1208,6 +1218,7 @@ handle_mount_dynamic (UDisksDaemon          *daemon,
                                          UDISKS_OBJECT (object),
                                          "filesystem-mount",
                                          0,
+                                         FALSE,
                                          NULL /* cancellable */);
 
   success = FALSE;
@@ -1392,11 +1403,11 @@ handle_mount (UDisksFilesystem      *filesystem,
                                system_managed,
                                system_managed ? FALSE : mpoint_persistent);
 
-  udisks_notice ("Mounted %s%s at %s on behalf of uid %u",
-                 device,
-                 system_managed ? " (system)" : "",
-                 mount_point_to_use,
-                 caller_uid);
+  udisks_info ("Mounted %s%s at %s on behalf of uid %u",
+               device,
+               system_managed ? " (system)" : "",
+               mount_point_to_use,
+               caller_uid);
 
   udisks_linux_block_object_trigger_uevent_sync (UDISKS_LINUX_BLOCK_OBJECT (object),
                                                  UDISKS_DEFAULT_WAIT_TIMEOUT);
@@ -1564,6 +1575,7 @@ handle_unmount (UDisksFilesystem      *filesystem,
                                              UDISKS_OBJECT (object),
                                              "filesystem-unmount",
                                              unmount_fstab_as_root ? 0 : caller_uid,
+                                             FALSE,
                                              NULL);
 
       if (!unmount_fstab_as_root && caller_uid != 0)
@@ -1600,13 +1612,13 @@ handle_unmount (UDisksFilesystem      *filesystem,
                                                                  * user requests unmounting a filesystem that is in
                                                                  * /etc/fstab file with the x-udisks-auth option.
                                                                  *
-                                                                 * Do not translate $(drive), it's a
+                                                                 * Do not translate $(device.name), it's a
                                                                  * placeholder and will be replaced by the name of
                                                                  * the drive/device in question
                                                                  *
                                                                  * Do not translate /etc/fstab
                                                                  */
-                                                                N_("Authentication is required to unmount $(drive) referenced in the /etc/fstab file"),
+                                                                N_("Authentication is required to unmount $(device.name) referenced in the /etc/fstab file"),
                                                                 invocation))
                 goto out;
               unmount_fstab_as_root = TRUE;
@@ -1623,10 +1635,10 @@ handle_unmount (UDisksFilesystem      *filesystem,
 
           goto out;
         }
-      udisks_notice ("Unmounted %s (system) from %s on behalf of uid %u",
-                     udisks_block_get_device (block),
-                     mount_point,
-                     caller_uid);
+      udisks_info ("Unmounted %s (system) from %s on behalf of uid %u",
+                   udisks_block_get_device (block),
+                   mount_point,
+                   caller_uid);
       goto waiting;
     }
 
@@ -1651,10 +1663,10 @@ handle_unmount (UDisksFilesystem      *filesystem,
        * requests unmounting a filesystem previously mounted by
        * another user.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to unmount $(drive) mounted by another user");
+      message = N_("Authentication is required to unmount $(device.name) mounted by another user");
 
       if (!udisks_daemon_util_check_authorization_sync (daemon,
                                                         object,
@@ -1669,6 +1681,7 @@ handle_unmount (UDisksFilesystem      *filesystem,
                                          UDISKS_OBJECT (object),
                                          "filesystem-unmount",
                                          0,
+                                         FALSE,
                                          NULL);
 
   if (!bd_fs_unmount (mount_point ? mount_point : udisks_block_get_device (block),
@@ -1690,9 +1703,9 @@ handle_unmount (UDisksFilesystem      *filesystem,
   /* filesystem unmounted, run the state/cleanup routines now to remove the mountpoint (if applicable) */
   udisks_state_check_block (state, udisks_linux_block_object_get_device_number (UDISKS_LINUX_BLOCK_OBJECT (object)));
 
-  udisks_notice ("Unmounted %s on behalf of uid %u",
-                 udisks_block_get_device (block),
-                 caller_uid);
+  udisks_info ("Unmounted %s on behalf of uid %u",
+               udisks_block_get_device (block),
+               caller_uid);
 
   waiting:
   /* wait for mount-points update before returning from method */
@@ -1819,10 +1832,10 @@ handle_set_label (UDisksFilesystem      *filesystem,
   /* Translators: Shown in authentication dialog when the user
    * requests changing the filesystem label.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to change the filesystem label on $(drive)");
+  message = N_("Authentication is required to change the filesystem label on $(device.name)");
   if (!udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
     {
       if (udisks_block_get_hint_system (block))
@@ -1850,6 +1863,7 @@ handle_set_label (UDisksFilesystem      *filesystem,
                                          object,
                                          "filesystem-modify",
                                          caller_uid,
+                                         FALSE,
                                          NULL /* cancellable */);
   if (job == NULL)
     {
@@ -1980,12 +1994,15 @@ handle_resize (UDisksFilesystem      *filesystem,
   if (existing_mount_points != NULL && g_strv_length ((gchar **) existing_mount_points) > 0)
     {
       if (! (mode & BD_FS_ONLINE_SHRINK) && ! (mode & BD_FS_ONLINE_GROW))
-        g_dbus_method_invocation_return_error (invocation,
-                                               UDISKS_ERROR,
-                                               UDISKS_ERROR_NOT_SUPPORTED,
-                                               "Cannot resize %s filesystem on %s if mounted",
-                                               probed_fs_usage,
-                                               udisks_block_get_device (block));
+        {
+          g_dbus_method_invocation_return_error (invocation,
+                                                 UDISKS_ERROR,
+                                                 UDISKS_ERROR_NOT_SUPPORTED,
+                                                 "Cannot resize %s filesystem on %s if mounted",
+                                                 probed_fs_usage,
+                                                 udisks_block_get_device (block));
+          goto out;
+        }
     }
   else if (! (mode & BD_FS_OFFLINE_SHRINK) && ! (mode & BD_FS_OFFLINE_GROW))
     {
@@ -1995,16 +2012,17 @@ handle_resize (UDisksFilesystem      *filesystem,
                                              "Cannot resize %s filesystem on %s if unmounted",
                                              probed_fs_usage,
                                              udisks_block_get_device (block));
+      goto out;
     }
 
   action_id = "org.freedesktop.udisks2.modify-device";
   /* Translators: Shown in authentication dialog when the user
    * requests resizing the filesystem.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to resize the filesystem on $(drive)");
+  message = N_("Authentication is required to resize the filesystem on $(device.name)");
   if (! udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
     {
       if (udisks_block_get_hint_system (block))
@@ -2030,6 +2048,7 @@ handle_resize (UDisksFilesystem      *filesystem,
                                          UDISKS_OBJECT (object),
                                          "filesystem-resize",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
   if (job == NULL)
     {
@@ -2166,16 +2185,17 @@ handle_repair (UDisksFilesystem      *filesystem,
                                              "Cannot repair %s filesystem on %s if mounted",
                                              probed_fs_usage,
                                              udisks_block_get_device (block));
+      goto out;
     }
 
   action_id = "org.freedesktop.udisks2.modify-device";
   /* Translators: Shown in authentication dialog when the user
    * requests resizing the filesystem.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to repair the filesystem on $(drive)");
+  message = N_("Authentication is required to repair the filesystem on $(device.name)");
   if (! udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
     {
       if (udisks_block_get_hint_system (block))
@@ -2201,6 +2221,7 @@ handle_repair (UDisksFilesystem      *filesystem,
                                          UDISKS_OBJECT (object),
                                          "filesystem-repair",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
   if (job == NULL)
     {
@@ -2216,7 +2237,7 @@ handle_repair (UDisksFilesystem      *filesystem,
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
                                              UDISKS_ERROR_FAILED,
-                                             "Error reparing filesystem on %s: %s",
+                                             "Error repairing filesystem on %s: %s",
                                              udisks_block_get_device (block),
                                              error->message);
       udisks_simple_job_complete (UDISKS_SIMPLE_JOB (job), FALSE, error->message);
@@ -2334,16 +2355,17 @@ handle_check (UDisksFilesystem      *filesystem,
                                              "Cannot check %s filesystem on %s if mounted",
                                              probed_fs_usage,
                                              udisks_block_get_device (block));
+      goto out;
     }
 
   action_id = "org.freedesktop.udisks2.modify-device";
   /* Translators: Shown in authentication dialog when the user
    * requests resizing the filesystem.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to check the filesystem on $(drive)");
+  message = N_("Authentication is required to check the filesystem on $(device.name)");
   if (! udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
     {
       if (udisks_block_get_hint_system (block))
@@ -2369,6 +2391,7 @@ handle_check (UDisksFilesystem      *filesystem,
                                          UDISKS_OBJECT (object),
                                          "filesystem-check",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
   if (job == NULL)
     {
@@ -2500,10 +2523,10 @@ handle_take_ownership (UDisksFilesystem      *filesystem,
   /* Translators: Shown in authentication dialog when the user
    * requests taking ownership of the filesystem.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to change ownership of the filesystem on $(drive)");
+  message = N_("Authentication is required to change ownership of the filesystem on $(device.name)");
 
   /* Check that the user is actually authorized to check the filesystem. */
   if (! udisks_daemon_util_check_authorization_sync (daemon,
@@ -2518,6 +2541,7 @@ handle_take_ownership (UDisksFilesystem      *filesystem,
                                          UDISKS_OBJECT (object),
                                          "filesystem-modify",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
   if (job == NULL)
     {
@@ -2667,10 +2691,10 @@ handle_set_uuid (UDisksFilesystem      *filesystem,
   /* Translators: Shown in authentication dialog when the user
    * requests changing the filesystem UUID.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to change the filesystem UUID on $(drive)");
+  message = N_("Authentication is required to change the filesystem UUID on $(device.name)");
   if (!udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
     {
       if (udisks_block_get_hint_system (block))
@@ -2698,6 +2722,7 @@ handle_set_uuid (UDisksFilesystem      *filesystem,
                                          object,
                                          "filesystem-modify",
                                          caller_uid,
+                                         FALSE,
                                          NULL /* cancellable */);
   if (job == NULL)
     {

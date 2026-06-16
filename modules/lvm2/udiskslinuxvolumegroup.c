@@ -53,7 +53,7 @@
 #include "jobhelpers.h"
 
 /**
- * SECTION:udiskslinuxvolume_group
+ * SECTION:udiskslinuxvolumegroup
  * @title: UDisksLinuxVolumeGroup
  * @short_description: Linux implementation of #UDisksVolumeGroup
  *
@@ -126,7 +126,9 @@ udisks_linux_volume_group_new (void)
 /**
  * udisks_linux_volume_group_update:
  * @volume_group: A #UDisksLinuxVolumeGroup.
- * @object: The enclosing #UDisksLinuxVolumeGroupObject instance.
+ * @vg_info: LVM volume group info
+ * @vg_pvs: List of LVM physical volumes in the volume group
+ * @needs_polling_ret: (out): Return location for whether polling is needed
  *
  * Updates the interface.
  */
@@ -336,6 +338,7 @@ handle_delete (UDisksVolumeGroup     *_group,
                                                UDISKS_OBJECT (object),
                                                "lvm-vg-delete",
                                                caller_uid,
+                                               FALSE,
                                                vgremove_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -457,6 +460,7 @@ handle_rename (UDisksVolumeGroup     *_group,
                                                UDISKS_OBJECT (object),
                                                "lvm-vg-rename",
                                                caller_uid,
+                                               FALSE,
                                                vgrename_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -585,6 +589,7 @@ handle_add_device (UDisksVolumeGroup     *_group,
                                                    UDISKS_OBJECT (object),
                                                    "lvm-pv-create",
                                                    caller_uid,
+                                                   FALSE,
                                                    pvcreate_job_func,
                                                    &pv_data,
                                                    NULL, /* user_data_free_func */
@@ -610,6 +615,7 @@ handle_add_device (UDisksVolumeGroup     *_group,
                                                UDISKS_OBJECT (object),
                                                "lvm-vg-add-device",
                                                caller_uid,
+                                               FALSE,
                                                vgextend_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -729,6 +735,7 @@ handle_remove_common (UDisksVolumeGroup     *_group,
                                                UDISKS_OBJECT (object),
                                                job_operation,
                                                caller_uid,
+                                               FALSE,
                                                job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -738,7 +745,7 @@ handle_remove_common (UDisksVolumeGroup     *_group,
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
                                              UDISKS_ERROR_FAILED,
-                                             (is_remove) ? "Error remove %s from volume group: %s" : "Error emptying %s: %s",
+                                             (is_remove) ? "Error removing %s from volume group: %s" : "Error emptying %s: %s",
                                              data.pv_path,
                                              error->message);
       g_clear_error (&error);
@@ -751,6 +758,7 @@ handle_remove_common (UDisksVolumeGroup     *_group,
                                                    UDISKS_OBJECT (object),
                                                    "pv-format-erase",
                                                    caller_uid,
+                                                   FALSE,
                                                    pvremove_job_func,
                                                    &data,
                                                    NULL, /* user_data_free_func */
@@ -854,6 +862,7 @@ handle_remove_missing_physical_volumes (UDisksVolumeGroup     *_group,
                                                UDISKS_OBJECT (object),
                                                "lvm-vg-rem-device",
                                                caller_uid,
+                                               FALSE,
                                                vgreduce_job_func,
                                                &data,
                                                NULL, /* user_data_free_func */
@@ -1098,6 +1107,7 @@ handle_create_volume (UDisksVolumeGroup              *_group,
                                                UDISKS_OBJECT (object),
                                                "lvm-vg-create-volume",
                                                caller_uid,
+                                               FALSE,
                                                create_function,
                                                &data,
                                                NULL, /* user_data_free_func */

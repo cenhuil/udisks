@@ -74,7 +74,7 @@ class UdisksBaseTest(udiskstestcase.UdisksTestCase):
                 manager.EnableModule(module, dbus.Boolean(False))
             manager.EnableModule(module, dbus.Boolean(True))
         with self.assertRaisesRegex(dbus.exceptions.DBusException,
-                                    r'cannot open shared object file: No such file or directory'):
+                                    r'Module not available: '):
             manager.EnableModule("non-exist_ent", dbus.Boolean(True))
         with self.assertRaisesRegex(dbus.exceptions.DBusException,
                                     r'Module unloading is not currently supported.'):
@@ -204,6 +204,21 @@ class UdisksBaseTest(udiskstestcase.UdisksTestCase):
         for path in block_paths:
             self.assertIn(path, dbus_blocks)
 
+    def test_51_get_drives(self):
+        # get all objects and filter drives
+        udisks = self.get_object('')
+        objects = udisks.GetManagedObjects(dbus_interface='org.freedesktop.DBus.ObjectManager')
+        drive_paths = [p for p in list(objects.keys()) if "/drives/" in p]
+
+        # get drives using the 'GetDrives' function
+        manager = self.get_interface(self.manager_obj, '.Manager')
+        dbus_drives = manager.GetDrives(self.no_options)
+
+        # and make sure both lists are equal
+        self.assertEqual(len(drive_paths), len(dbus_drives))
+        for path in drive_paths:
+            self.assertIn(path, dbus_drives)
+
     def _wipe(self, device, retry=True):
         ret, out = self.run_command('wipefs -a %s' % device)
         if ret != 0:
@@ -290,7 +305,7 @@ class UdisksBaseTest(udiskstestcase.UdisksTestCase):
 
         # format another disk to ext4 with the same label, ResolveDevice should
         # now return both devices
-        ret, _out = self.run_command('mkfs.ext4 -F -L %s %s' % (label, self.vdevs[1]))
+        ret, out = self.run_command('mkfs.ext4 -F -L %s %s' % (label, self.vdevs[1]))
         if ret != 0:
             self.fail('Failed to create ext4 filesystem on %s: %s' % (self.vdevs[1], out))
         self.addCleanup(self._wipe, self.vdevs[1])

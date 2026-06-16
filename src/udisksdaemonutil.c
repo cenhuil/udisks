@@ -243,7 +243,8 @@ udisks_decode_udev_string (const gchar *str, const gchar *fallback_str)
         {
           gint val;
 
-          if (str[n + 1] != 'x' || str[n + 2] == '\0' || str[n + 3] == '\0')
+          if (str[n + 1] != 'x' || str[n + 2] == '\0' || str[n + 3] == '\0' ||
+              g_ascii_xdigit_value (str[n + 2]) < 0 || g_ascii_xdigit_value (str[n + 3]) < 0)
             {
               udisks_warning ("**** NOTE: malformed encoded string `%s'", str);
               break;
@@ -295,7 +296,7 @@ udisks_decode_udev_string (const gchar *str, const gchar *fallback_str)
  * <literal>[A-Z][a-z][0-9]_</literal> will be escaped as _HEX where
  * HEX is a two-digit hexadecimal number.
  *
- * Note that his mapping is not bijective - e.g. you cannot go back
+ * Note that this mapping is not bijective - e.g. you cannot go back
  * to the original string.
  */
 void
@@ -484,7 +485,7 @@ udisks_daemon_util_resolve_link (const gchar *path,
  * Resolves all symlinks in @path/@dir_name. This can be used to
  * easily walk e.g. holders or slaves of block devices.
  *
- * Returns: An array of canonicalized absolute pathnames. Free with g_strfreev().
+ * Returns: (array zero-terminated=1): An array of canonicalized absolute pathnames. Free with g_strfreev().
  */
 gchar **
 udisks_daemon_util_resolve_links (const gchar *path,
@@ -508,9 +509,9 @@ udisks_daemon_util_resolve_links (const gchar *path,
       if (resolved != NULL)
         g_ptr_array_add (p, resolved);
     }
-  g_ptr_array_add (p, NULL);
 
  out:
+  g_ptr_array_add (p, NULL);
   if (dir != NULL)
     g_dir_close (dir);
   g_free (s);
@@ -690,6 +691,63 @@ check_authorization_no_polkit (UDisksDaemon            *daemon,
   return ret;
 }
 
+
+static gchar *
+get_device_display_name (UDisksBlock *block) 
+{
+  gchar *display_name = NULL;
+  gchar *s = NULL;
+  const gchar *id_label = NULL;
+  const gchar *id_usage = NULL;
+  const gchar *id_type = NULL;
+
+  if (block == NULL) 
+    goto out;
+
+  id_label = udisks_block_get_id_label (block);
+  id_usage = udisks_block_get_id_usage (block);
+  id_type = udisks_block_get_id_type (block);
+  if (id_label != NULL && strlen (id_label) > 0)
+    {
+      display_name = g_strdup (id_label);
+    }
+  else if (g_strcmp0 (id_usage, "crypto") == 0)
+    {
+      s = udisks_client_get_size_for_display (NULL, udisks_block_get_size (block), FALSE, FALSE);
+      if (g_strcmp0 (id_type, "crypto_unknown") == 0)
+        {
+          /* Translators: This is used for possibly encrypted volumes.
+          *              The first %s is the formatted size (e.g. "42.0 MB").
+          */
+          display_name = g_strdup_printf (N_("%s Possibly Encrypted"), s);
+        }
+      else
+        {
+          /* Translators: This is used for encrypted volumes.
+          *              The first %s is the formatted size (e.g. "42.0 MB").
+          */
+          display_name = g_strdup_printf (N_("%s Encrypted"), s);
+        }
+      g_free (s);
+    }
+  else
+    {
+      guint64 size = udisks_block_get_size (block);
+      if (size > 0)
+        {
+          s = udisks_client_get_size_for_display (NULL, size, FALSE, FALSE);
+          /* Translators: This is used for volume with no filesystem label.
+          *              The first %s is the formatted size (e.g. "42.0 MB").
+          */
+          display_name = g_strdup_printf (N_("%s Volume"), s);
+          g_free (s);
+        }
+    }
+
+  out:
+  return display_name;
+}
+
 /**
  * udisks_daemon_util_check_authorization_sync:
  * @daemon: A #UDisksDaemon.
@@ -716,8 +774,9 @@ check_authorization_no_polkit (UDisksDaemon            *daemon,
  * can be used in @message but note that not all variables can be used
  * in all checks. For example, any check involving a #UDisksDrive or a
  * #UDisksBlock object can safely include the fragment
- * <quote>$(drive)</quote> since it will always expand to the name of
- * the drive, e.g. <quote>INTEL SSDSA2MH080G1GC (/dev/sda1)</quote> or
+ * <quote>$(device.name)</quote> since it will always expand to the name of
+ * the partition or drive, e.g. <quote>MyUDisks (/dev/sda1)</quote> or
+ * <quote>INTEL SSDSA2MH080G1GC (/dev/sda1)</quote> or
  * the block device file e.g. <quote>/dev/vg_lucifer/lv_root</quote>
  * or <quote>/dev/sda1</quote>. However this won't work for operations
  * that isn't on a drive or block device, for example calls on the
@@ -774,6 +833,7 @@ udisks_daemon_util_check_authorization_sync_with_error (UDisksDaemon           *
   gboolean auth_no_user_interaction = FALSE;
   const gchar *details_device = NULL;
   gchar *details_drive = NULL;
+  gchar *device_display_name = NULL;
 
   authority = udisks_daemon_get_authority (daemon);
   if (authority == NULL)
@@ -885,6 +945,14 @@ udisks_daemon_util_check_authorization_sync_with_error (UDisksDaemon           *
 
   if (block != NULL)
     {
+      gchar *s = NULL;
+      s = get_device_display_name (block);
+      if (s)
+        {
+          device_display_name = g_strdup_printf ("%s (%s)", s, details_device);
+          g_free (s);
+        }
+
       _safe_polkit_details_insert (details, "id.type",    udisks_block_get_id_type (block));
       _safe_polkit_details_insert (details, "id.usage",   udisks_block_get_id_usage (block));
       _safe_polkit_details_insert (details, "id.version", udisks_block_get_id_version (block));
@@ -909,6 +977,9 @@ udisks_daemon_util_check_authorization_sync_with_error (UDisksDaemon           *
     polkit_details_insert (details, "device", details_device);
   if (details_drive != NULL)
     polkit_details_insert (details, "drive", details_drive);
+  if (device_display_name == NULL)
+    device_display_name = g_strdup (details_drive);
+  polkit_details_insert (details, "device.name", device_display_name);
 
   sub_error = NULL;
   result = polkit_authority_check_authorization_sync (authority,
@@ -962,6 +1033,7 @@ udisks_daemon_util_check_authorization_sync_with_error (UDisksDaemon           *
 
  out:
   g_free (details_drive);
+  g_free (device_display_name);
   g_clear_object (&block_object);
   g_clear_object (&drive_object);
   g_clear_object (&block);
@@ -1056,7 +1128,7 @@ udisks_daemon_util_get_user_info (const uid_t uid,
       g_set_error (error,
                    UDISKS_ERROR,
                    UDISKS_ERROR_FAILED,
-                   "User with uid %d does not exist", (gint) uid);
+                   "User with uid %u does not exist", (guint) uid);
       goto out;
     }
   else if (pw == NULL)
@@ -1064,7 +1136,7 @@ udisks_daemon_util_get_user_info (const uid_t uid,
       g_set_error (error,
                    UDISKS_ERROR,
                    UDISKS_ERROR_FAILED,
-                   "Error looking up passwd struct for uid %d: %m", (gint) uid);
+                   "Error looking up passwd struct for uid %u: %m", (guint) uid);
       goto out;
     }
 
@@ -1265,8 +1337,6 @@ udisks_daemon_util_on_user_seat (UDisksDaemon *daemon,
   return TRUE;
 #else
   gboolean ret = FALSE;
-  char *session = NULL;
-  char *seat = NULL;
   const gchar *drive_seat;
   UDisksObject *drive_object = NULL;
   UDisksDrive *drive = NULL;
@@ -1308,8 +1378,6 @@ udisks_daemon_util_on_user_seat (UDisksDaemon *daemon,
     }
 
  out:
-  free (seat);
-  free (session);
   g_clear_object (&drive_object);
   g_clear_object (&drive);
   return ret;
@@ -1447,11 +1515,12 @@ udisks_daemon_util_file_set_contents (const gchar  *filename,
                    G_IO_ERROR,
                    g_io_error_from_errno (errno),
                    "Error calling fdopen: %m");
+      close (fd);
       g_unlink (tmpl);
       goto out;
     }
 
-  if (contents_len < 0 )
+  if (contents_len < 0)
     contents_len = strlen (contents);
   if (fwrite (contents, 1, contents_len, f) != (gsize) contents_len)
     {

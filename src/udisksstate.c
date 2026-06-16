@@ -783,6 +783,7 @@ udisks_state_check_mounted_fs_entry (UDisksState  *state,
           if (!udisks_daemon_launch_spawned_job_sync (state->daemon,
                                                       NULL, /* UDisksObject */
                                                       "cleanup", 0, /* StartedByUID */
+                                                      FALSE,
                                                       NULL, /* GCancellable */
                                                       0,    /* uid_t run_as_uid */
                                                       0,    /* uid_t run_as_euid */
@@ -1247,6 +1248,7 @@ udisks_state_check_unlocked_crypto_dev_entry (UDisksState  *state,
                                                        NULL, /* UDisksObject */
                                                        "cleanup",
                                                        0, /* StartedByUID */
+                                                       FALSE,
                                                        luks_close_job_func,
                                                        &data,
                                                        NULL, /* user_data_free_func */
@@ -1797,8 +1799,9 @@ iterate_list (GVariant *list, node_cb visit, gpointer compare_data,
 }
 
 static gboolean
-_udisks_state_has_loop_list_visitor (GVariant *child, gpointer compare_data,
-                                     gpointer user_data )
+_udisks_state_has_loop_list_visitor (GVariant *child,
+                                     gpointer  compare_data,
+                                     gpointer  user_data)
 {
   gboolean ret = FALSE;
   const gchar *iter_device_file = NULL;
@@ -1807,8 +1810,9 @@ _udisks_state_has_loop_list_visitor (GVariant *child, gpointer compare_data,
 
   g_variant_get (child, "{&s@a{sv}}", &iter_device_file, &details);
 
-  if (g_strcmp0 (iter_device_file, ((gchar*)compare_data)) == 0)
+  if (g_strcmp0 (iter_device_file, ((gchar*) compare_data)) == 0)
     {
+      ret = TRUE;
       if (out_uid != NULL)
         {
           GVariant *lookup_value;
@@ -1818,13 +1822,12 @@ _udisks_state_has_loop_list_visitor (GVariant *child, gpointer compare_data,
             {
               *out_uid = g_variant_get_uint32 (lookup_value);
               g_variant_unref (lookup_value);
-              ret = TRUE;
             }
         }
     }
-    g_variant_unref (details);
+  g_variant_unref (details);
 
-    return ret;
+  return ret;
 }
 
 /**
@@ -2095,8 +2098,8 @@ _udisks_state_has_mdraid_list_visitor (GVariant *child, gpointer compare_data,
               g_variant_unref (lookup_value);
             }
         }
-      g_variant_unref (details);
     }
+  g_variant_unref (details);
   return ret;
 }
 
@@ -2384,7 +2387,7 @@ udisks_state_set (UDisksState          *state,
   g_variant_ref_sink (value);
   normalized = g_variant_get_normal_form (value);
   size = g_variant_get_size (normalized);
-  data = g_malloc (size);
+  data = g_malloc (size ? size : 1); /* ensure the buffer is allocated even if size=0 */
   g_variant_store (normalized, data);
 
   path = get_state_file_path (key);

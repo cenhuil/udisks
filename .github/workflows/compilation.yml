@@ -1,8 +1,4 @@
-name: Run static analysis using csmock
-
-env:
-  CSMOCK_CHROOTS: "default"
-  CSMOCK_TOOLS: "clang cppcheck gcc"
+name: Run compilation tests
 
 on:
   pull_request:
@@ -11,10 +7,10 @@ on:
 
 jobs:
   build:
-    name: csmock
-    runs-on: ubuntu-22.04
+    name: compilation
+    runs-on: ubuntu-24.04
     env:
-      CI_CONTAINER: udisks-ci-csmock
+      CI_CONTAINER: udisks-ci-compilation
     steps:
       - name: Checkout udisks repository
         uses: actions/checkout@v6
@@ -36,13 +32,10 @@ jobs:
         run: |
           podman exec -it ${{ env.CI_CONTAINER }} bash -c "ansible-playbook -i "localhost," -c local misc/install-test-dependencies.yml"
 
-      - name: Run csmock build in the container
+      - name: Remove libblockdev SMART plugin
         run: |
-          podman exec -it ${{ env.CI_CONTAINER }} bash -c "/ci/run_csmock_tests -c /ci/copr-builder.conf -p udisks -t ${{ env.CSMOCK_TOOLS }} -r ${{ env.CSMOCK_CHROOTS }}"
+          podman exec -it ${{ env.CI_CONTAINER }} bash -c "dnf -y remove libblockdev-smart libblockdev-smartmontools libblockdev-smart-devel"
 
-      - name: Upload the csmock logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: csmock_logs
-          path: csmock_*/*
+      - name: Compile UDisks with SMART disabled
+        run: |
+          podman exec -it ${{ env.CI_CONTAINER }} bash -c "./autogen.sh --disable-smart && make -j"

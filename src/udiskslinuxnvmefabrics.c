@@ -124,7 +124,7 @@ udisks_linux_nvme_fabrics_new (void)
  */
 gboolean
 udisks_linux_nvme_fabrics_update (UDisksLinuxNVMeFabrics *ctrl,
-                                     UDisksLinuxDriveObject    *object)
+                                  UDisksLinuxDriveObject *object)
 {
   UDisksNVMeFabrics *iface = UDISKS_NVME_FABRICS (ctrl);
   UDisksLinuxDevice *device;
@@ -180,10 +180,12 @@ handle_disconnect (UDisksNVMeFabrics     *_object,
   UDisksLinuxDriveObject *object;
   UDisksLinuxDevice *device = NULL;
   UDisksDaemon *daemon = NULL;
+  UDisksLinuxProvider *provider;
   GError *error = NULL;
   const gchar *message;
   const gchar *action_id;
   gchar *object_path = NULL;
+  const gchar *subsysnqn;
 
   object = udisks_daemon_util_dup_object (_object, &error);
   if (object == NULL)
@@ -195,10 +197,10 @@ handle_disconnect (UDisksNVMeFabrics     *_object,
   /* Translators: Shown in authentication dialog when the user
    * requests disconnect of a NVMeoF connected controller.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to disconnect a NVMe over Fabrics controller $(drive)");
+  message = N_("Authentication is required to disconnect a NVMe over Fabrics controller $(device.name)");
   action_id = "org.freedesktop.udisks2.nvme-disconnect";
 
   /* Check that the user is authorized */
@@ -213,6 +215,8 @@ handle_disconnect (UDisksNVMeFabrics     *_object,
 
   device = udisks_linux_drive_object_get_device (object, TRUE /* get_hw */);
   g_assert (device != NULL);
+
+  subsysnqn = g_udev_device_get_sysfs_attr (device->udev_device, "subsysnqn");
 
   if (!bd_nvme_disconnect_by_path (g_udev_device_get_device_file (device->udev_device),
                                    &error))
@@ -235,6 +239,12 @@ handle_disconnect (UDisksNVMeFabrics     *_object,
       g_prefix_error (&error, "Error waiting for the NVMeoF object to disappear after disconnecting: ");
       g_dbus_method_invocation_take_error (invocation, error);
       goto out;
+    }
+
+  if (subsysnqn && strlen (subsysnqn) > 0)
+    {
+      provider = udisks_daemon_get_linux_provider (daemon);
+      udisks_linux_provider_trigger_nvme_subsystem_uevent (provider, subsysnqn, UDISKS_UEVENT_ACTION_REMOVE, device);
     }
 
   udisks_nvme_fabrics_complete_disconnect (_object, invocation);

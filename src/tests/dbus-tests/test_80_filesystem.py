@@ -35,7 +35,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
     @classmethod
     def setUpClass(cls):
         udiskstestcase.UdisksTestCase.setUpClass()
-        if not BlockDev.is_initialized():
+        if not BlockDev.is_initialized():  # pylint: disable=no-value-for-parameter
             BlockDev.init(cls.requested_plugins, None)
         else:
             BlockDev.reinit(cls.requested_plugins, True, None)
@@ -92,9 +92,9 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
 
     def _check_can_create(self):
         try:
-            avail, opts, util = BlockDev.fs_can_mkfs(self._fs_signature)
+            avail, _opts, util = BlockDev.fs_can_mkfs(self._fs_signature)
         except Exception as e:
-            self.skipTest(e.message)
+            self.skipTest(str(e))
         if util is not None:
             self.skipTest('Cannot create filesystem %s: required command `%s` not found' % (self._fs_signature, util))
         if not avail:
@@ -102,14 +102,14 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
 
     def _check_can_label(self):
         # basic mkfs checks are covered by previous _check_can_create()
-        avail, opts, util = BlockDev.fs_can_mkfs(self._fs_signature)
+        _avail, opts, _util = BlockDev.fs_can_mkfs(self._fs_signature)
         return opts & BlockDev.FSMkfsOptionsFlags.LABEL
 
     def _check_can_relabel(self):
         try:
             avail, util = BlockDev.fs_can_set_label(self._fs_signature)
         except Exception as e:
-            self.skipTest(e.message)
+            self.skipTest(str(e))
         if util is not None:
             self.skipTest('Cannot set label on an existing %s filesystem: required command `%s` not found' % (self._fs_signature, util))
         if not avail:
@@ -119,7 +119,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
         try:
             avail, util = BlockDev.fs_can_set_uuid(self._fs_signature)
         except Exception as e:
-            self.skipTest(e.message)
+            self.skipTest(str(e))
         if util is not None:
             self.skipTest('Cannot set UUID on an existing %s filesystem: required command `%s` not found' % (self._fs_signature, util))
         if not avail:
@@ -308,11 +308,11 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
 
         manager = self.get_interface(self.get_object('/Manager'), '.Manager')
         try:
-          rep, mode, _ = manager.CanResize(self._fs_signature)
-          chk, _ = manager.CanCheck(self._fs_signature)
-          rpr, _ = manager.CanRepair(self._fs_signature)
-        except:
-          rpr = chk = rep = False
+            rep, mode, _ = manager.CanResize(self._fs_signature)
+            chk, _ = manager.CanCheck(self._fs_signature)
+            rpr, _ = manager.CanRepair(self._fs_signature)
+        except Exception:
+            rpr = chk = rep = False
         if not (rpr and chk and rep) or mode & BlockDev.FSResizeFlags.OFFLINE_SHRINK == 0:
             self.skipTest('Cannot check, offline-shrink and repair %s filesystem' % self._fs_signature)
 
@@ -358,7 +358,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
         manager = self.get_interface(self.get_object('/Manager'), '.Manager')
         try:
             res, mode, _ = manager.CanResize(self._fs_signature)
-        except:
+        except Exception:
             res = False
             mode = 0
         if not res:
@@ -399,8 +399,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
 
             # resize the loop device
             temp.truncate(TMP_SIZE_2)
-            self.run_command('losetup -c /dev/%s' % loop_dev)
-            time.sleep(2)
+            loop_dev_obj.SetCapacity(self.no_options, dbus_interface=self.iface_prefix + '.Loop')
             bsize = self.get_property(loop_dev_obj, '.Block', 'Size')
             bsize.assertEqual(TMP_SIZE_2)
             fssize = self.get_property(loop_dev_obj, '.Filesystem', 'Size')
@@ -420,7 +419,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
         self._test_grow(True)
 
     def test_offline_grow(self):
-        self._test_grow(True)
+        self._test_grow(False)
 
     def test_size(self):
         self._check_can_create()
@@ -588,7 +587,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             conf_file_path = self._get_mount_options_conf_path()
             conf_file_backup = self.read_file(conf_file_path)
             self.addCleanup(self.write_file, conf_file_path, conf_file_backup)
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             # no existing mount_options.conf, simply remove the file once finished
             self.addCleanup(self.remove_file, conf_file_path, True)
 
@@ -634,7 +633,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             test_readonly(self, False, "[defaults]\nntfs:ntfs_defaults=ro\n\n[%sx]\nntfs:ntfs3_defaults=rw\n" % block_fs_dev)
             test_readonly(self, True,  "[defaults]\ndefaults=ro\nntfs_defaults=ro\n\n[%sx]\nntfs:ntfs3_defaults=rw\n" % block_fs_dev)
             test_readonly(self, True,  "[defaults]\ndefaults=ro\nntfs:ntfs_defaults=ro\n\n[%sx]\nntfs:ntfs3_defaults=rw\n" % block_fs_dev)
-            if self._have_ntfs3g:
+            if self._have_ntfs3g:  # pylint: disable=no-member
                 test_readonly(self, False, "[defaults]\nntfs_defaults=ro\nntfs:ntfs3_defaults=rw\nntfs_drivers=ntfs3,ntfs\n", ignore_fstype=True)
                 test_readonly(self, False, "[defaults]\nntfs_defaults=ro\nntfs:ntfs3_defaults=rw\nntfs_drivers=ntfs3\n", ignore_fstype=True)
                 test_readonly(self, True,  "[defaults]\nntfs_defaults=ro\nntfs:ntfs3_defaults=rw\nntfs_drivers=ntfs,ntfs3\n", ignore_fstype=True)
@@ -709,7 +708,6 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             test_custom_option(self, False, None, True,  "[defaults]\nvfat_defaults=uid=,gid=,shortname=mixed,utf8=1,showexec\n", udev_rules_content = { "UDISKS_MOUNT_OPTIONS_VFAT_DEFAULTS": "uid=,gid=,shortname=mixed,utf8=1,showexec,flush" }, match_mount_option="flush")
             test_custom_option(self, False, None, True,  "[defaults]\nvfat_defaults=xxxxx\n\n[%s]\nvfat_defaults=yyyyyy\n" % block_fs_dev, udev_rules_content = { "UDISKS_MOUNT_OPTIONS_VFAT_DEFAULTS": "uid=,gid=,shortname=mixed,utf8=1,showexec,flush" }, match_mount_option="flush")
 
-
     def _test_fstab_label(self, disk_obj_path, label, fstab_label_str, mount_should_fail):
         self._check_can_create()
 
@@ -722,8 +720,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             self.skipTest('Cannot mount %s filesystem' % self._fs_signature)
 
         # this test will change /etc/fstab, we might want to revert the changes after it finishes
-        fstab = self.read_file('/etc/fstab')
-        self.addCleanup(self.write_file, '/etc/fstab', fstab)
+        self._conf_backup('/etc/fstab')
 
         disk = self.get_object(disk_obj_path)
         self.assertIsNotNone(disk)
@@ -841,7 +838,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
     def _remove_partition(self, part):
         try:
             part.Delete(self.no_options, dbus_interface=self.iface_prefix + '.Partition')
-        except:
+        except Exception:
             pass
 
     @udiskstestcase.tag_test(udiskstestcase.TestTags.UNSAFE)
@@ -972,7 +969,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             self.assertHasIface(disk, 'org.freedesktop.UDisks2.PartitionTable')
             parts = self.get_property(disk, '.PartitionTable', 'Partitions')
             parts.assertLen(1)
-        except:
+        except Exception:
             self.skipTest('Known protective partition table detection deficiencies on the kernel side, no parttable found this time, skipping...')
 
         pttype = self.get_property(disk, '.PartitionTable', 'Type')
@@ -993,7 +990,7 @@ class UdisksFSTestCase(udiskstestcase.UdisksTestCase):
             self.skipTest('Filesystem %s does not create protective partition table' % self._fs_signature)
         self._check_can_create()
 
-        disk, part = self._create_protective_part()
+        _disk, part = self._create_protective_part()
 
         # attempt to create another filesystem on the partition
         msg = 'This partition cannot be modified because it contains a partition table; please reinitialize layout of the whole device.'
@@ -1499,8 +1496,7 @@ class NonPOSIXTestCase(UdisksFSTestCase):
             self.skipTest('Cannot mount %s filesystem' % self._fs_signature)
 
         # this test will change /etc/fstab, we might want to revert the changes after it finishes
-        fstab = self.read_file('/etc/fstab')
-        self.addCleanup(self.write_file, '/etc/fstab', fstab)
+        self._conf_backup('/etc/fstab')
 
         # create filesystem
         disk.Format(self._fs_signature, self.no_options, dbus_interface=self.iface_prefix + '.Block')
@@ -1711,8 +1707,19 @@ class NTFSCommonTestCase(UdisksFSTestCase):
     @classmethod
     def setUpClass(cls):
         super(NTFSCommonTestCase, cls).setUpClass()
-        if not BlockDev.utils_have_kernel_module('ntfs3') and not BlockDev.utils_have_kernel_module('ntfs3') and not cls._have_ntfs3g:
+
+        if not BlockDev.utils_have_kernel_module('ntfs') and not BlockDev.utils_have_kernel_module('ntfs3') and not cls._have_ntfs3g:
             raise unittest.SkipTest('No ntfs/ntfs3/ntfs3g implementation available, skipping.')
+
+        if not cls._have_ntfs3g:
+            # Check if 'ntfs' is available in /proc/filesystems
+            try:
+                with open('/proc/filesystems', 'r') as f:
+                    filesystems = f.read()
+                if "ntfs\n" not in filesystems:
+                    raise unittest.SkipTest('ntfs filesystem not found in /proc/filesystems, skipping.')
+            except (IOError, OSError):
+                raise unittest.SkipTest('Unable to read /proc/filesystems, skipping.')
 
     def test_mount_auto_configurable_mount_options(self):
         raise unittest.SkipTest('Not applicable for the common NTFS test case, skipping.')
@@ -1818,8 +1825,7 @@ class FailsystemTestCase(UdisksFSTestCase):
 
         msg = '[Ww]rong fs type'
         with self.assertRaisesRegex(dbus.exceptions.DBusException, msg):
-            mnt_path = disk.Mount(d, dbus_interface=self.iface_prefix + '.Filesystem')
-            self.assertIsNone(mnt_path)
+            disk.Mount(d, dbus_interface=self.iface_prefix + '.Filesystem')
 
         # invalid option
         d = dbus.Dictionary(signature='sv')
@@ -1828,8 +1834,7 @@ class FailsystemTestCase(UdisksFSTestCase):
         msg = 'org.freedesktop.UDisks2.Error.OptionNotPermitted: Mount option '\
               '`definitely-nonexisting-option\' is not allowed'
         with self.assertRaisesRegex(dbus.exceptions.DBusException, msg):
-            mnt_path = disk.Mount(d, dbus_interface=self.iface_prefix + '.Filesystem')
-            self.assertIsNone(mnt_path)
+            disk.Mount(d, dbus_interface=self.iface_prefix + '.Filesystem')
 
         # should not be mounted -- so lets try to unmount it
         msg = 'org.freedesktop.UDisks2.Error.NotMounted: Device `%s\' is not '\

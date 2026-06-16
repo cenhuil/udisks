@@ -275,7 +275,7 @@ is_authed (GDBusMethodInvocation    *invocation,
                                                      UDISKS_OBJECT (block_object),
                                                      LSM_POLICY_ACTION_ID,
                                                      options,
-                                                     N_("Authentication is required to change $(drive) LED"),
+                                                     N_("Authentication is required to change $(device.name) LED"),
                                                      invocation))
     goto out;
 
@@ -389,7 +389,7 @@ udisks_linux_drive_lsm_local_iface_init (UDisksDriveLsmLocalIface *iface)
 
 static gboolean
 udisks_linux_drive_lsm_local_module_object_process_uevent (UDisksModuleObject *module_object,
-                                                           const gchar        *action,
+                                                           UDisksUeventAction  action,
                                                            UDisksLinuxDevice  *device,
                                                            gboolean           *keep)
 {

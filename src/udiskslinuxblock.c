@@ -58,7 +58,6 @@
 #include "udisksfstabentry.h"
 #include "udiskscrypttabmonitor.h"
 #include "udiskscrypttabentry.h"
-#include "udisksdaemonutil.h"
 #include "udisksbasejob.h"
 #include "udiskssimplejob.h"
 #include "udiskslinuxdriveata.h"
@@ -93,7 +92,7 @@ struct _UDisksLinuxBlock
 {
   UDisksBlockSkeleton parent_instance;
 
-  /* only allow single cryptsetup call at once */
+  /* per-device lock for cryptsetup info calls */
   GMutex encrypted_lock;
 };
 
@@ -108,6 +107,9 @@ G_DEFINE_TYPE_WITH_CODE (UDisksLinuxBlock, udisks_linux_block, UDISKS_TYPE_BLOCK
                          G_IMPLEMENT_INTERFACE (UDISKS_TYPE_BLOCK, block_iface_init));
 
 /* ---------------------------------------------------------------------------------------------------- */
+
+/* global lock for all libcryptsetup calls (libcryptsetup/libdevmapper is not thread safe) */
+static GMutex global_encrypted_lock;
 
 static void
 udisks_linux_block_init (UDisksLinuxBlock *block)
@@ -177,6 +179,9 @@ get_sysfs_attr (GUdevDevice *device,
       udisks_debug ("Failed to read sysfs attribute %s: %s", attr, error->message);
       g_clear_error (&error);
     }
+
+  if (value != NULL)
+    g_strchomp (value);
 
   g_free (filename);
   return value;
@@ -1028,7 +1033,7 @@ udisks_linux_block_update (UDisksLinuxBlock       *block,
       gchar *dm_uuid;
       dm_uuid = get_sysfs_attr (device->udev_device, "dm/uuid");
       if (dm_uuid != NULL &&
-           (g_str_has_prefix (dm_uuid, "CRYPT-LUKS") || g_str_has_prefix (dm_uuid, "CRYPT-BITLK") || g_str_has_prefix (dm_uuid, "CRYPT-TCRYPT")))
+           (g_str_has_prefix (dm_uuid, "CRYPT-LUKS") || g_str_has_prefix (dm_uuid, "CRYPT-BITLK") || g_str_has_prefix (dm_uuid, "CRYPT-TCRYPT") || g_str_has_prefix(dm_uuid, "CRYPT-PLAIN") ))
         {
           gchar *slave_sysfs_path;
           slave_sysfs_path = get_slave_sysfs_path (g_udev_device_get_sysfs_path (device->udev_device));
@@ -1236,25 +1241,6 @@ udisks_linux_block_update (UDisksLinuxBlock       *block,
   g_free (s);
   s = udisks_decode_udev_string (g_udev_device_get_property (device->udev_device, "ID_FS_UUID_ENC"),
                                  g_udev_device_get_property (device->udev_device, "ID_FS_UUID"));
-  if ((!s || strlen (s) == 0) && udisks_linux_block_is_bitlk (iface))
-    {
-      BDCryptoBITLKInfo *bitlk_info;
-
-      /* Attempt to retrieve bitlk uuid from the on-disk header */
-      bitlk_info = bd_crypto_bitlk_info (device_file, &error);
-      if (bitlk_info)
-        {
-          g_free (s);
-          s = g_strdup (bitlk_info->uuid);
-          bd_crypto_bitlk_info_free (bitlk_info);
-        }
-      else
-        {
-          g_warning ("Crypto bitlk container detected on %s but failed to parse the header: %s",
-                     device_file, error->message);
-          g_error_free (error);
-        }
-    }
   udisks_block_set_id_uuid (iface, s);
   g_free (s);
 
@@ -1427,7 +1413,7 @@ track_parents (UDisksBlock *block, const gchar *options)
     {
       end = strchr (start, ',');
       if (end)
-        strcpy (start, end+1);
+        memmove (start, end + 1, strlen (end + 1) + 1);
       else
         *start = '\0';
     }
@@ -1666,24 +1652,49 @@ has_whitespace (const gchar *s)
   return FALSE;
 }
 
-static gchar *
-make_block_luksname (UDisksBlock *block, GError **error)
+/**
+ * udisks_linux_block_make_dm_name:
+ * @block: A #UDisksBlock.
+ *
+ * Calculates the device-mapper name to use for a crypto device
+ * based on block label, UUID and type. Uses label if available,
+ * otherwise falls back to a type-prefixed UUID, or type-prefixed
+ * device number as a last resort.
+ *
+ * Returns: A newly allocated string with the dm name. Free with g_free().
+ */
+gchar *
+udisks_linux_block_make_dm_name (UDisksBlock *block)
 {
-  BDCryptoLUKSInfo *info = NULL;
+  const gchar *label;
+  const gchar *uuid;
+  const gchar *prefix;
 
-  udisks_linux_block_encrypted_lock (block);
-  info = bd_crypto_luks_info (udisks_block_get_device (block), error);
-  udisks_linux_block_encrypted_unlock (block);
-
-  if (info)
+  label = udisks_block_get_id_label (block);
+  if (label && g_strcmp0 (label, "") != 0)
     {
-      gchar *ret = g_strdup_printf ("luks-%s", info->uuid);
-      bd_crypto_luks_info_free (info);
+      gchar *safe_name;
 
-      return ret;
+      if (strlen (label) >= 128)
+        safe_name = g_strndup (label, 127);
+      else
+        safe_name = g_strdup (label);
+
+      return g_strdelimit (safe_name, "/ ", '_');
     }
+
+  if (udisks_linux_block_is_luks (block))
+    prefix = "luks";
+  else if (udisks_linux_block_is_bitlk (block))
+    prefix = "bitlk";
   else
-    return NULL;
+    prefix = "tcrypt";
+
+  uuid = udisks_block_get_id_uuid (block);
+  if (uuid && g_strcmp0 (uuid, "") != 0)
+    return g_strdup_printf ("%s-%s", prefix, uuid);
+
+  return g_strdup_printf ("%s-%" G_GUINT64_FORMAT, prefix, udisks_block_get_device_number (block));
 }
 
 static gboolean
@@ -2066,7 +2077,8 @@ handle_add_configuration_item (UDisksBlock           *_block,
     }
 
  out:
-  g_variant_unref (details);
+  if (details != NULL)
+    g_variant_unref (details);
   g_clear_object (&object);
   return TRUE; /* returning TRUE means that we handled the method invocation */
 }
@@ -2145,7 +2157,8 @@ handle_remove_configuration_item (UDisksBlock           *_block,
     }
 
  out:
-  g_variant_unref (details);
+  if (details != NULL)
+    g_variant_unref (details);
   g_clear_object (&object);
   return TRUE; /* returning TRUE means that we handled the method invocation */
 }
@@ -2237,8 +2250,10 @@ handle_update_configuration_item (UDisksBlock           *_block,
     }
 
  out:
-  g_variant_unref (new_details);
-  g_variant_unref (old_details);
+  if (new_details != NULL)
+    g_variant_unref (new_details);
+  if (old_details != NULL)
+    g_variant_unref (old_details);
   g_clear_object (&object);
   return TRUE; /* returning TRUE means that we handled the method invocation */
 }
@@ -2478,7 +2493,7 @@ erase_device (UDisksBlock   *block,
       goto out;
     }
 
-  job = udisks_daemon_launch_simple_job (daemon, object, "format-erase", caller_uid, NULL);
+  job = udisks_daemon_launch_simple_job (daemon, object, "format-erase", caller_uid, FALSE, NULL);
   udisks_base_job_set_auto_estimate (UDISKS_BASE_JOB (job), TRUE);
   udisks_job_set_progress_valid (UDISKS_JOB (job), TRUE);
 
@@ -2808,15 +2823,64 @@ udisks_linux_block_is_unknown_crypto (UDisksBlock *block)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+/**
+ * udisks_linux_block_encrypted_lock:
+ * @block: A #UDisksBlock.
+ *
+ * Acquires both the global cryptsetup lock and the per-device lock.
+ * Use this for active operations (unlock, lock, resize, format, etc.)
+ * that modify device state.
+ *
+ * Must be paired with udisks_linux_block_encrypted_unlock().
+ */
 void
 udisks_linux_block_encrypted_lock (UDisksBlock *block)
+{
+  UDisksLinuxBlock *block_iface = UDISKS_LINUX_BLOCK (block);
+  g_mutex_lock (&global_encrypted_lock);
+  g_mutex_lock (&block_iface->encrypted_lock);
+}
+
+/**
+ * udisks_linux_block_encrypted_unlock:
+ * @block: A #UDisksBlock.
+ *
+ * Releases both the per-device lock and the global cryptsetup lock.
+ * Must be paired with udisks_linux_block_encrypted_lock().
+ */
+void
+udisks_linux_block_encrypted_unlock (UDisksBlock *block)
+{
+  UDisksLinuxBlock *block_iface = UDISKS_LINUX_BLOCK (block);
+  g_mutex_unlock (&block_iface->encrypted_lock);
+  g_mutex_unlock (&global_encrypted_lock);
+}
+
+/**
+ * udisks_linux_block_encrypted_info_lock:
+ * @block: A #UDisksBlock.
+ *
+ * Acquires only the per-device lock. Use this for info operations
+ * that read device metadata without modifying state.
+ *
+ * Must be paired with udisks_linux_block_encrypted_info_unlock().
+ */
+void
+udisks_linux_block_encrypted_info_lock (UDisksBlock *block)
 {
   UDisksLinuxBlock *block_iface = UDISKS_LINUX_BLOCK (block);
   g_mutex_lock (&block_iface->encrypted_lock);
 }
 
+/**
+ * udisks_linux_block_encrypted_info_unlock:
+ * @block: A #UDisksBlock.
+ *
+ * Releases the per-device lock.
+ * Must be paired with udisks_linux_block_encrypted_info_lock().
+ */
 void
-udisks_linux_block_encrypted_unlock (UDisksBlock *block)
+udisks_linux_block_encrypted_info_unlock (UDisksBlock *block)
 {
   UDisksLinuxBlock *block_iface = UDISKS_LINUX_BLOCK (block);
   g_mutex_unlock (&block_iface->encrypted_lock);
@@ -2903,10 +2967,10 @@ format_check_auth (UDisksDaemon          *daemon,
        * requests erasing a hard disk using the SECURE ERASE UNIT
        * command.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to perform a secure erase of $(drive)");
+      message = N_("Authentication is required to perform a secure erase of $(device.name)");
       action_id = "org.freedesktop.udisks2.ata-secure-erase";
     }
   else
@@ -2915,10 +2979,10 @@ format_check_auth (UDisksDaemon          *daemon,
        * device. This includes both creating a filesystem or partition
        * table.
        *
-       * Do not translate $(drive), it's a placeholder and will
+       * Do not translate $(device.name), it's a placeholder and will
        * be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to format $(drive)");
+      message = N_("Authentication is required to format $(device.name)");
       action_id = format_extra_args ? "org.freedesktop.udisks2.modify-device-system" :
                                       "org.freedesktop.udisks2.modify-device";
       if (!udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
@@ -3144,6 +3208,7 @@ format_create_luks (UDisksDaemon  *daemon,
                     guint32        encrypt_iterations,
                     guint32        encrypt_time,
                     guint32        encrypt_threads,
+                    const gchar   *encrypt_label,
                     UDisksBlock  **block_to_mkfs,
                     UDisksObject **object_to_mkfs,
                     GError       **error)
@@ -3172,6 +3237,7 @@ format_create_luks (UDisksDaemon  *daemon,
   crypto_job_data.iterations = encrypt_iterations;
   crypto_job_data.time = encrypt_time;
   crypto_job_data.threads = encrypt_threads;
+  crypto_job_data.label = encrypt_label;
 
   /* Create it */
   udisks_linux_block_encrypted_lock (block);
@@ -3179,6 +3245,7 @@ format_create_luks (UDisksDaemon  *daemon,
                                                object,
                                                "format-mkfs",
                                                caller_uid,
+                                               FALSE,
                                                luks_format_job_func,
                                                &crypto_job_data,
                                                NULL, /* user_data_free_func */
@@ -3211,18 +3278,14 @@ format_create_luks (UDisksDaemon  *daemon,
 
   /* Open it */
   crypto_job_data.read_only = FALSE;
-  crypto_job_data.map_name = make_block_luksname (block, error);
-  if (!crypto_job_data.map_name)
-    {
-      g_prefix_error (error, "Failed to get LUKS UUID: ");
-      return FALSE;
-    }
+  crypto_job_data.map_name = udisks_linux_block_make_dm_name (block);
 
   udisks_linux_block_encrypted_lock (block);
   if (!udisks_daemon_launch_threaded_job_sync (daemon,
                                                object,
                                                "format-mkfs",
                                                caller_uid,
+                                               FALSE,
                                                luks_open_job_func,
                                                &crypto_job_data,
                                                NULL, /* user_data_free_func */
@@ -3411,6 +3474,7 @@ udisks_linux_block_handle_format (UDisksBlock             *block,
   guint32 encrypt_iterations = 0;
   guint32 encrypt_time = 0;
   guint32 encrypt_threads = 0;
+  const gchar *encrypt_label = NULL;
   const gchar *erase_type = NULL;
   gboolean no_block = FALSE;
   gboolean update_partition_type = FALSE;
@@ -3445,6 +3509,7 @@ udisks_linux_block_handle_format (UDisksBlock             *block,
   g_variant_lookup (options, "encrypt.iterations", "u", &encrypt_iterations);
   g_variant_lookup (options, "encrypt.time", "u", &encrypt_time);
   g_variant_lookup (options, "encrypt.threads", "u", &encrypt_threads);
+  g_variant_lookup (options, "encrypt.label", "&s", &encrypt_label);
   g_variant_lookup (options, "erase", "&s", &erase_type);
   g_variant_lookup (options, "no-block", "b", &no_block);
   g_variant_lookup (options, "update-partition-type", "b", &update_partition_type);
@@ -3563,6 +3628,7 @@ udisks_linux_block_handle_format (UDisksBlock             *block,
                                                    object,
                                                    "format-mkfs",
                                                    caller_uid,
+                                                   FALSE,
                                                    format_job_func,
                                                    &format_job_data,
                                                    NULL, /* user_data_free_func */
@@ -3588,6 +3654,7 @@ udisks_linux_block_handle_format (UDisksBlock             *block,
                                encrypt_iterations,
                                encrypt_time,
                                encrypt_threads,
+                               encrypt_label,
                                &block_to_mkfs,
                                &object_to_mkfs,
                                &error))
@@ -3670,6 +3737,7 @@ udisks_linux_block_handle_format (UDisksBlock             *block,
                                                    object,
                                                    "format-mkfs",
                                                    caller_uid,
+                                                   FALSE,
                                                    format_job_func,
                                                    &format_job_data,
                                                    NULL, /* user_data_free_func */
@@ -3900,10 +3968,10 @@ handle_open_for_backup (UDisksBlock           *block,
                                                     /* Translators: Shown in authentication dialog when creating a
                                                      * disk image file.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and will
+                                                     * Do not translate $(device.name), it's a placeholder and will
                                                      * be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to open $(drive) for reading"),
+                                                    N_("Authentication is required to open $(device.name) for reading"),
                                                     invocation))
     goto out;
 
@@ -3971,10 +4039,10 @@ handle_open_for_restore (UDisksBlock           *block,
                                                     /* Translators: Shown in authentication dialog when restoring
                                                      * from a disk image file.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and will
+                                                     * Do not translate $(device.name), it's a placeholder and will
                                                      * be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to open $(drive) for writing"),
+                                                    N_("Authentication is required to open $(device.name) for writing"),
                                                     invocation))
     goto out;
 
@@ -4045,10 +4113,10 @@ handle_open_for_benchmark (UDisksBlock           *block,
                                                     /* Translators: Shown in authentication dialog when an application
                                                      * wants to benchmark a device.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and will
+                                                     * Do not translate $(device.name), it's a placeholder and will
                                                      * be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to open $(drive) for benchmarking"),
+                                                    N_("Authentication is required to open $(device.name) for benchmarking"),
                                                     invocation))
     goto out;
 
@@ -4128,10 +4196,10 @@ handle_open_device (UDisksBlock           *block,
                                                     /* Translators: Shown in authentication dialog when an application
                                                      * wants to benchmark a device.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and will
+                                                     * Do not translate $(device.name), it's a placeholder and will
                                                      * be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to open $(drive)."),
+                                                    N_("Authentication is required to open $(device.name)."),
                                                     invocation))
     goto out;
 
@@ -4185,10 +4253,10 @@ handle_rescan (UDisksBlock           *block,
   /* Translators: Shown in authentication dialog when an application
    * wants to rescan a device.
    *
-   * Do not translate $(drive), it's a placeholder and will
+   * Do not translate $(device.name), it's a placeholder and will
    * be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to rescan $(drive)");
+  message = N_("Authentication is required to rescan $(device.name)");
   action_id = "org.freedesktop.udisks2.rescan";
 
   if (!udisks_daemon_util_check_authorization_sync (daemon,
@@ -4231,6 +4299,7 @@ handle_restore_encrypted_header (UDisksBlock           *encrypted,
     UDisksBlock *block;
     UDisksDaemon *daemon;
     UDisksState *state = NULL;
+    const gchar *action_id;
     uid_t caller_uid;
     GError *error = NULL;
     UDisksBaseJob *job = NULL;
@@ -4255,10 +4324,38 @@ handle_restore_encrypted_header (UDisksBlock           *encrypted,
         goto out;
       }
 
+    action_id = "org.freedesktop.udisks2.modify-device";
+    if (!udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
+      {
+        if (udisks_block_get_hint_system (block))
+          {
+            action_id = "org.freedesktop.udisks2.modify-device-system";
+          }
+        else if (!udisks_daemon_util_on_user_seat (daemon, object, caller_uid))
+          {
+            action_id = "org.freedesktop.udisks2.modify-device-other-seat";
+          }
+      }
+
+    if (!udisks_daemon_util_check_authorization_sync (daemon,
+                                                      object,
+                                                      action_id,
+                                                      options,
+                                                      /* Translators: Shown in authentication dialog when restoring
+                                                       * a LUKS header on a device.
+                                                       *
+                                                       * Do not translate $(device.name), it's a placeholder and will
+                                                       * be replaced by the name of the drive/device in question
+                                                       */
+                                                      N_("Authentication is required to restore the encrypted header on $(device.name)"),
+                                                      invocation))
+      goto out;
+
     job = udisks_daemon_launch_simple_job (daemon,
                                            UDISKS_OBJECT (object),
                                            "block-restore-encrypted-header",
                                            caller_uid,
+                                           FALSE,
                                            NULL);
     if (job == NULL)
       {

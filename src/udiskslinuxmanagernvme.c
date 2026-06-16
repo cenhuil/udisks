@@ -33,7 +33,9 @@
 #include "udisksdaemonutil.h"
 #include "udisksstate.h"
 #include "udiskslinuxblockobject.h"
+#include "udiskslinuxdriveobject.h"
 #include "udiskslinuxdevice.h"
+#include "udiskslinuxprovider.h"
 #include "udiskssimplejob.h"
 
 /**
@@ -290,14 +292,87 @@ manager_update (UDisksLinuxManagerNVMe *manager)
 
 /* ---------------------------------------------------------------------------------------------------- */
 
+static void
+parse_sysfs_addr(const gchar  *addr,
+                 const gchar  *transport,
+                 gchar       **traddr,
+                 gchar       **trsvcid,
+                 gchar       **host_traddr,
+                 gchar       **host_iface)
+{
+    gchar **s, **ss;
+
+    if (g_strcmp0 (transport, "pcie") == 0 ||
+        g_strcmp0 (transport, "loop") == 0)
+        return;
+
+    s = g_strsplit (addr, ",", -1);
+    for (ss = s; *ss; ss++)
+      {
+        if (g_ascii_strncasecmp (*ss, "traddr=", 7) == 0)
+            *traddr = g_strdup (*ss + 7);
+        else if (g_ascii_strncasecmp (*ss, "trsvcid=", 8) == 0)
+            *trsvcid = g_strdup (*ss + 8);
+        else if (g_ascii_strncasecmp (*ss, "host_traddr=", 12) == 0)
+            *host_traddr = g_strdup (*ss + 12);
+        else if (g_ascii_strncasecmp (*ss, "host_iface=", 11) == 0)
+            *host_iface = g_strdup (*ss + 11);
+      }
+    g_strfreev (s);
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
 typedef struct
 {
   const gchar *subsysnqn;
   const gchar *transport;
   const gchar *transport_addr;
+  const gchar *transport_svcid;
+  const gchar *host_traddr;
+  const gchar *host_iface;
   const gchar *host_nqn;
   const gchar *host_id;
 } WaitForConnectData;
+
+static gboolean
+fabrics_object_matches (UDisksNVMeController *ctrl,
+                        UDisksNVMeFabrics    *fab,
+                        WaitForConnectData   *data)
+{
+  gchar *traddr = NULL;
+  gchar *trsvcid = NULL;
+  gchar *host_traddr = NULL;
+  gchar *host_iface = NULL;
+  gboolean match;
+
+  if (g_strcmp0 (udisks_nvme_controller_get_subsystem_nqn (ctrl), data->subsysnqn) != 0 ||
+      g_strcmp0 (udisks_nvme_fabrics_get_transport (fab), data->transport) != 0 ||
+      (data->host_nqn && g_strcmp0 (udisks_nvme_fabrics_get_host_nqn (fab), data->host_nqn) != 0) ||
+      (data->host_id && g_strcmp0 (udisks_nvme_fabrics_get_host_id (fab), data->host_id) != 0))
+    return FALSE;
+
+  if (data->transport_addr || data->transport_svcid || data->host_traddr || data->host_iface)
+    {
+      parse_sysfs_addr (udisks_nvme_fabrics_get_transport_address (fab),
+                        udisks_nvme_fabrics_get_transport (fab),
+                        &traddr, &trsvcid, &host_traddr, &host_iface);
+
+      match = (!data->transport_addr || g_strcmp0 (traddr, data->transport_addr) == 0) &&
+              (!data->transport_svcid || g_strcmp0 (trsvcid, data->transport_svcid) == 0) &&
+              (!data->host_traddr || g_strcmp0 (host_traddr, data->host_traddr) == 0) &&
+              (!data->host_iface || g_strcmp0 (host_iface, data->host_iface) == 0);
+
+      g_free (traddr);
+      g_free (trsvcid);
+      g_free (host_traddr);
+      g_free (host_iface);
+
+      return match;
+    }
+
+  return TRUE;
+}
 
 static UDisksObject *
 wait_for_fabrics_object (UDisksDaemon *daemon,
@@ -316,25 +391,14 @@ wait_for_fabrics_object (UDisksDaemon *daemon,
 
       ctrl = udisks_object_get_nvme_controller (object);
       fab = udisks_object_get_nvme_fabrics (object);
-      if (ctrl && fab)
-        {
-          if (g_strcmp0 (udisks_nvme_controller_get_subsystem_nqn (ctrl), data->subsysnqn) == 0 &&
-              g_strcmp0 (udisks_nvme_fabrics_get_transport (fab), data->transport) == 0 &&
-              (!data->transport_addr || g_strcmp0 (udisks_nvme_fabrics_get_transport_address (fab), data->transport_addr) == 0) &&
-              (!data->host_nqn || g_strcmp0 (udisks_nvme_fabrics_get_host_nqn (fab), data->host_nqn) == 0) &&
-              (!data->host_id || g_strcmp0 (udisks_nvme_fabrics_get_host_id (fab), data->host_id) == 0))
-            {
-              g_object_unref (ctrl);
-              g_object_unref (fab);
-              ret = g_object_ref (object);
-              goto out;
-            }
-        }
+      if (ctrl && fab && fabrics_object_matches (ctrl, fab, data))
+        ret = g_object_ref (object);
       g_clear_object (&ctrl);
       g_clear_object (&fab);
+      if (ret != NULL)
+        break;
     }
 
- out:
   g_list_free_full (objects, g_object_unref);
   return ret;
 }
@@ -379,9 +443,9 @@ fabrics_options_to_extra (GVariant *arg_options)
       else if (g_variant_is_of_type (value, G_VARIANT_TYPE_UINT32))
         v = g_strdup_printf ("%u", g_variant_get_uint32 (value));
       else if (g_variant_is_of_type (value, G_VARIANT_TYPE_INT64))
-        v = g_strdup_printf ("%ld", g_variant_get_int64 (value));
-      else if (g_variant_is_of_type (value, G_VARIANT_TYPE_UINT32))
-        v = g_strdup_printf ("%lu", g_variant_get_uint64 (value));
+        v = g_strdup_printf ("%" G_GINT64_FORMAT, g_variant_get_int64 (value));
+      else if (g_variant_is_of_type (value, G_VARIANT_TYPE_UINT64))
+        v = g_strdup_printf ("%" G_GUINT64_FORMAT, g_variant_get_uint64 (value));
       else
         {
           udisks_warning ("fabrics_options_to_extra: unhandled extra option '%s' of type %s, ignoring",
@@ -414,6 +478,8 @@ handle_connect (UDisksManagerNVMe     *object,
   uid_t caller_uid;
   UDisksObject *ctrl_object = NULL;
   WaitForConnectData wait_data;
+  UDisksLinuxDevice *device = NULL;
+  UDisksLinuxProvider *provider;
   GError *error = NULL;
 
   if (arg_transport_addr && strlen (arg_transport_addr) == 0)
@@ -462,6 +528,9 @@ handle_connect (UDisksManagerNVMe     *object,
   wait_data.subsysnqn = arg_subsysnqn;
   wait_data.transport = arg_transport;
   wait_data.transport_addr = arg_transport_addr;
+  wait_data.transport_svcid = transport_svcid;
+  wait_data.host_traddr = host_traddr;
+  wait_data.host_iface = host_iface;
   wait_data.host_nqn = host_nqn;
   wait_data.host_id = host_id;
 
@@ -478,6 +547,13 @@ handle_connect (UDisksManagerNVMe     *object,
       goto out;
     }
 
+  device = udisks_linux_drive_object_get_device (UDISKS_LINUX_DRIVE_OBJECT (ctrl_object), TRUE /* get_hw */);
+  if (device)
+    {
+      provider = udisks_daemon_get_linux_provider (manager->daemon);
+      udisks_linux_provider_trigger_nvme_subsystem_uevent (provider, arg_subsysnqn, UDISKS_UEVENT_ACTION_ADD, device);
+    }
+
   udisks_manager_nvme_complete_connect (object,
                                         invocation,
                                         g_dbus_object_get_object_path (G_DBUS_OBJECT (ctrl_object)));
@@ -485,6 +561,7 @@ handle_connect (UDisksManagerNVMe     *object,
  out:
   if (ctrl_object != NULL)
     g_object_unref (ctrl_object);
+  g_clear_object (&device);
   bd_extra_arg_list_free (extra_args);
   return TRUE; /* returning TRUE means that we handled the method invocation */
 }

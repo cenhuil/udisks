@@ -381,7 +381,7 @@ handle_loop_setup (UDisksManager          *object,
     goto out;
 
   fd_num = g_variant_get_handle (fd_index);
-  if (fd_list == NULL || fd_num >= g_unix_fd_list_get_length (fd_list))
+  if (fd_list == NULL || fd_num < 0 || fd_num >= g_unix_fd_list_get_length (fd_list))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
@@ -494,11 +494,6 @@ handle_loop_setup (UDisksManager          *object,
 
 /* ---------------------------------------------------------------------------------------------------- */
 
-typedef struct
-{
-  gint md_num;
-} WaitForArrayData;
-
 static UDisksObject *
 wait_for_array_object (UDisksDaemon *daemon,
                        gpointer      user_data)
@@ -558,7 +553,7 @@ handle_mdraid_create (UDisksManager         *_object,
   struct stat statbuf;
   dev_t raid_device_num;
   UDisksBaseJob *job = NULL;
-  const gchar **disks = NULL;
+  gchar **disks = NULL;
   guint disks_top = 0;
   gboolean success = FALSE;
   const gchar *option_bitmap = NULL;
@@ -598,6 +593,7 @@ handle_mdraid_create (UDisksManager         *_object,
                                          NULL,
                                          "mdraid-create",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
 
   if (job == NULL)
@@ -759,7 +755,7 @@ handle_mdraid_create (UDisksManager         *_object,
     }
 
   /* names of members as gchar** for libblockdev */
-  disks = g_new0 (const gchar*, g_list_length (blocks) + 1);
+  disks = g_new0 (gchar*, g_list_length (blocks) + 1);
   for (l = blocks; l != NULL; l = l->next)
     {
       UDisksBlock *block = UDISKS_BLOCK (l->data);
@@ -769,7 +765,7 @@ handle_mdraid_create (UDisksManager         *_object,
 
   g_variant_lookup (arg_options, "bitmap", "^&ay", &option_bitmap);
   g_variant_lookup (arg_options, "version", "^&ay", &option_version);
-  if (!bd_md_create (array_name, arg_level, disks, 0, option_version, option_bitmap, arg_chunk, NULL, &error))
+  if (!bd_md_create (array_name, arg_level, (const gchar **) disks, 0, option_version, option_bitmap, arg_chunk, NULL, &error))
     {
       g_prefix_error (&error, "Error creating RAID array: ");
       udisks_simple_job_complete (UDISKS_SIMPLE_JOB (job), FALSE, error->message);
@@ -892,7 +888,7 @@ handle_mdraid_create (UDisksManager         *_object,
       udisks_simple_job_complete (UDISKS_SIMPLE_JOB (job), success, NULL);
     }
 
-  g_strfreev ((gchar **) disks);
+  g_strfreev (disks);
   g_free (raid_device_file);
   g_free (raid_node);
   g_free (array_name);
@@ -933,8 +929,12 @@ load_modules_in_idle_cb (gpointer user_data)
       /* Load single requested module */
       if (! udisks_module_manager_load_single_module (module_manager, data->module_name, &error))
         {
+          if (g_error_matches (error, UDISKS_ERROR, UDISKS_ERROR_NOT_SUPPORTED))
+            /* Module not available, change to UDISKS_ERROR_FAILED for backwards compatibility */
+            error->code = UDISKS_ERROR_FAILED;
+          else
+            g_warning ("Error initializing module '%s': %s", data->module_name, error->message);
           g_prefix_error (&error, "Error initializing module '%s': ", data->module_name);
-          g_warning ("%s", error->message);
           g_dbus_method_invocation_take_error (data->invocation, error);
         }
       else
@@ -1184,6 +1184,37 @@ get_block_objects (UDisksManager *manager,
   return ret;
 }
 
+static GSList*
+get_drive_objects (UDisksManager *manager,
+                   guint         *num_drives)
+{
+  UDisksLinuxManager *linux_manager = UDISKS_LINUX_MANAGER (manager);
+  GDBusObjectManagerServer *object_manager = NULL;
+  GList *objects = NULL;
+  GList *objects_p = NULL;
+  GSList *ret = NULL;
+
+  object_manager = udisks_daemon_get_object_manager (linux_manager->daemon);
+  objects = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (object_manager));
+
+  for (objects_p = objects; objects_p != NULL; objects_p = objects_p->next)
+    {
+      UDisksObject *object = UDISKS_OBJECT (objects_p->data);
+      UDisksDrive *drive;
+
+      drive = udisks_object_get_drive (object);
+      if (drive != NULL)
+        {
+          ret = g_slist_prepend (ret, drive);
+          (*num_drives)++;
+        }
+    }
+
+  g_list_free_full (objects, g_object_unref);
+  ret = g_slist_reverse (ret);
+  return ret;
+}
+
 static gboolean
 handle_get_block_devices (UDisksManager         *object,
                           GDBusMethodInvocation *invocation,
@@ -1204,12 +1235,43 @@ handle_get_block_devices (UDisksManager         *object,
 		  block_paths[i++] = g_dbus_object_get_object_path (block_object);
   }
 
-  udisks_manager_complete_get_block_devices  (object,
-                                              invocation,
-                                              block_paths);
+  udisks_manager_complete_get_block_devices (object,
+                                             invocation,
+                                             block_paths);
 
   g_free (block_paths);
   g_slist_free_full (blocks, g_object_unref);
+
+  return TRUE;  /* returning TRUE means that we handled the method invocation */
+}
+
+static gboolean
+handle_get_drives (UDisksManager         *object,
+                   GDBusMethodInvocation *invocation,
+                   GVariant              *arg_options)
+{
+  GSList *drives = NULL;
+  GSList *drives_p = NULL;
+  const gchar **drive_paths = NULL;
+  guint num_drives = 0;
+  guint i = 0;
+
+  drives = get_drive_objects (object, &num_drives);
+  drive_paths = g_new0 (const gchar *, num_drives + 1);
+
+  for (drives_p = drives; drives_p != NULL; drives_p = drives_p->next)
+    {
+      GDBusObject *drive_object = g_dbus_interface_get_object (G_DBUS_INTERFACE (drives_p->data));
+      if (drive_object)
+        drive_paths[i++] = g_dbus_object_get_object_path (drive_object);
+    }
+
+  udisks_manager_complete_get_drives (object,
+                                      invocation,
+                                      drive_paths);
+
+  g_free (drive_paths);
+  g_slist_free_full (drives, g_object_unref);
 
   return TRUE;  /* returning TRUE means that we handled the method invocation */
 }
@@ -1322,4 +1384,5 @@ manager_iface_init (UDisksManagerIface *iface)
   iface->handle_can_repair = handle_can_repair;
   iface->handle_get_block_devices = handle_get_block_devices;
   iface->handle_resolve_device = handle_resolve_device;
+  iface->handle_get_drives = handle_get_drives;
 }

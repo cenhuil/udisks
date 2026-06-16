@@ -37,8 +37,6 @@
 #include <glib/gstdio.h>
 #include <errno.h>
 
-#include <blockdev/smart.h>
-
 #include "udiskslogging.h"
 #include "udiskslinuxprovider.h"
 #include "udiskslinuxdriveobject.h"
@@ -52,6 +50,106 @@
 #include "udisksata.h"
 #include "udiskslinuxdevice.h"
 #include "udisksconfigmanager.h"
+
+#ifdef HAVE_SMART
+#include <blockdev/smart.h>
+#else
+/* Stub definitions when SMART support is disabled */
+typedef struct _BDSmartATA BDSmartATA;
+typedef struct _BDSmartATAAttribute BDSmartATAAttribute;
+
+typedef enum {
+  BD_SMART_ATA_SELF_TEST_STATUS_COMPLETED_NO_ERROR = 0,
+  BD_SMART_ATA_SELF_TEST_STATUS_ABORTED_HOST,
+  BD_SMART_ATA_SELF_TEST_STATUS_INTR_HOST_RESET,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_FATAL,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_UNKNOWN,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_ELECTRICAL,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_SERVO,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_READ,
+  BD_SMART_ATA_SELF_TEST_STATUS_ERROR_HANDLING,
+  BD_SMART_ATA_SELF_TEST_STATUS_IN_PROGRESS = 15
+} BDSmartATASelfTestStatus;
+
+typedef enum {
+  BD_SMART_SELF_TEST_OP_SHORT,
+  BD_SMART_SELF_TEST_OP_LONG,
+  BD_SMART_SELF_TEST_OP_OFFLINE,
+  BD_SMART_SELF_TEST_OP_CONVEYANCE,
+  BD_SMART_SELF_TEST_OP_ABORT
+} BDSmartSelfTestOp;
+
+typedef enum {
+  BD_SMART_ERROR,
+} BDSmartError;
+
+enum {
+  BD_SMART_ERROR_TECH_UNAVAIL
+};
+
+struct _BDSmartATA {
+  gboolean smart_supported;
+  gboolean smart_enabled;
+  gboolean overall_status_passed;
+  gdouble temperature;
+  guint64 power_on_time;
+  BDSmartATASelfTestStatus self_test_status;
+  gint self_test_percent_remaining;
+  BDSmartATAAttribute **attributes;
+};
+
+struct _BDSmartATAAttribute {
+  guint8 id;
+  gchar *well_known_name;
+  guint16 flags;
+  gint value;
+  gint worst;
+  gint threshold;
+  guint64 pretty_value;
+  gint pretty_value_unit;
+  gboolean failing_now;
+  gboolean failed_past;
+  guint64 value_raw;
+};
+
+static inline void
+bd_smart_ata_free (BDSmartATA *data)
+{
+}
+
+static inline BDSmartATA*
+bd_smart_ata_get_info_from_data (guint8 *data, gsize data_len, GError **error)
+{
+  g_set_error (error, UDISKS_ERROR, UDISKS_ERROR_NOT_SUPPORTED,
+               "ATA SMART support has been disabled during compilation");
+  return NULL;
+}
+
+static inline BDSmartATA*
+bd_smart_ata_get_info (const gchar *device, const BDExtraArg **extra, GError **error)
+{
+  g_set_error (error, UDISKS_ERROR, UDISKS_ERROR_NOT_SUPPORTED,
+               "ATA SMART support has been disabled during compilation");
+  return NULL;
+}
+
+static inline gboolean
+bd_smart_device_self_test (const gchar *device, BDSmartSelfTestOp operation, const BDExtraArg **extra, GError **error)
+{
+  g_set_error (error, UDISKS_ERROR, UDISKS_ERROR_NOT_SUPPORTED,
+               "ATA SMART support has been disabled during compilation");
+  return FALSE;
+}
+
+static inline gboolean
+bd_smart_set_enabled (const gchar *device, gboolean enabled, const BDExtraArg **extra, GError **error)
+{
+  g_set_error (error, UDISKS_ERROR, UDISKS_ERROR_NOT_SUPPORTED,
+               "ATA SMART support has been disabled during compilation");
+  return FALSE;
+}
+#endif
+
 
 /**
  * SECTION:udiskslinuxdriveata
@@ -83,6 +181,8 @@ struct _UDisksLinuxDriveAta
   gboolean     secure_erase_in_progress;
   unsigned long drive_read, drive_write;
   gboolean     standby_enabled;
+
+  GMutex       object_lock;
 };
 
 struct _UDisksLinuxDriveAtaClass
@@ -104,6 +204,8 @@ udisks_linux_drive_ata_finalize (GObject *object)
 
   bd_smart_ata_free (drive->smart_data);
 
+  g_mutex_clear (&drive->object_lock);
+
   if (G_OBJECT_CLASS (udisks_linux_drive_ata_parent_class)->finalize != NULL)
     G_OBJECT_CLASS (udisks_linux_drive_ata_parent_class)->finalize (object);
 }
@@ -111,6 +213,8 @@ udisks_linux_drive_ata_finalize (GObject *object)
 static void
 udisks_linux_drive_ata_init (UDisksLinuxDriveAta *drive)
 {
+  g_mutex_init (&drive->object_lock);
+
   g_dbus_interface_skeleton_set_flags (G_DBUS_INTERFACE_SKELETON (drive),
                                        G_DBUS_INTERFACE_SKELETON_FLAGS_HANDLE_METHOD_INVOCATIONS_IN_THREAD);
 }
@@ -139,8 +243,6 @@ udisks_linux_drive_ata_new (void)
 }
 
 /* ---------------------------------------------------------------------------------------------------- */
-
-G_LOCK_DEFINE_STATIC (object_lock);
 
 static const gchar *
 selftest_status_to_string (BDSmartATASelfTestStatus status)
@@ -207,16 +309,19 @@ update_smart (UDisksLinuxDriveAta *drive,
   guint16 word_85 = 0;
 
 #ifdef HAVE_SMART
-  /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
-  word_82 = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
-  word_85 = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
-  supported = word_82 & (1<<0);
-  enabled = word_85 & (1<<0);
-#else
-  supported = enabled = FALSE;
+  supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_SMART");
+  enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_SMART_ENABLED");
+  if (!supported && device->ata_identify_device_data)
+    {
+      /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
+      word_82 = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
+      word_85 = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
+      supported = word_82 & (1<<0);
+      enabled = word_85 & (1<<0);
+    }
 #endif
 
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   if ((drive->smart_is_from_blob || enabled) && drive->smart_updated > 0)
     {
       if (drive->smart_is_from_blob)
@@ -234,7 +339,7 @@ update_smart (UDisksLinuxDriveAta *drive,
                            &num_attributes_failed_in_the_past,
                            &num_bad_sectors);
     }
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
 
   if (selftest_status == NULL)
     selftest_status = "";
@@ -277,25 +382,52 @@ update_pm (UDisksLinuxDriveAta *drive,
   guint16 word_86 = 0;
   guint16 word_94 = 0;
 
-  /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
-  word_82 = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
-  word_83 = udisks_ata_identify_get_word (device->ata_identify_device_data, 83);
-  word_85 = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
-  word_86 = udisks_ata_identify_get_word (device->ata_identify_device_data, 86);
-  word_94 = udisks_ata_identify_get_word (device->ata_identify_device_data, 94);
+  pm_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_PM");
+  pm_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_PM_ENABLED");
+  apm_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_APM");
+  apm_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_APM_ENABLED");
+  aam_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_AAM");
+  aam_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_AAM_ENABLED");
+  write_cache_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_WRITE_CACHE");
+  write_cache_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_WRITE_CACHE_ENABLED");
+  read_lookahead_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_READ_LOOKAHEAD");
+  read_lookahead_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_READ_LOOKAHEAD_ENABLED");
+  aam_vendor_recommended_value = g_udev_device_get_property_as_int (device->udev_device, "ID_ATA_FEATURE_SET_AAM_VENDOR_RECOMMENDED_VALUE");
 
-  pm_supported  = word_82 & (1<<3);
-  pm_enabled    = word_85 & (1<<3);
-  apm_supported = word_83 & (1<<3);
-  apm_enabled   = word_86 & (1<<3);
-  aam_supported = word_83 & (1<<9);
-  aam_enabled   = word_86 & (1<<9);
-  if (aam_supported)
-    aam_vendor_recommended_value = (word_94 >> 8);
-  write_cache_supported    = word_82 & (1<<5);
-  write_cache_enabled      = word_85 & (1<<5);
-  read_lookahead_supported = word_82 & (1<<6);
-  read_lookahead_enabled   = word_85 & (1<<6);
+  if (device->ata_identify_device_data)
+    {
+      /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
+      word_82 = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
+      word_85 = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
+
+      /* available in udev since < 2012 */
+      if (!g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA"))
+        {
+          word_83 = udisks_ata_identify_get_word (device->ata_identify_device_data, 83);
+          word_86 = udisks_ata_identify_get_word (device->ata_identify_device_data, 86);
+          word_94 = udisks_ata_identify_get_word (device->ata_identify_device_data, 94);
+
+          pm_supported  = word_82 & (1<<3);
+          pm_enabled    = word_85 & (1<<3);
+          apm_supported = word_83 & (1<<3);
+          apm_enabled   = word_86 & (1<<3);
+          aam_supported = word_83 & (1<<9);
+          aam_enabled   = word_86 & (1<<9);
+          if (aam_supported)
+            aam_vendor_recommended_value = (word_94 >> 8);
+          write_cache_supported    = word_82 & (1<<5);
+          write_cache_enabled      = word_85 & (1<<5);
+        }
+
+      /* added recently, unable to distinguish between "not supported by device"
+       * and "not implemented by udev"
+       */
+      if (!read_lookahead_supported)
+        {
+          read_lookahead_supported = word_82 & (1<<6);
+          read_lookahead_enabled   = word_85 & (1<<6);
+        }
+    }
 
   g_object_freeze_notify (G_OBJECT (drive));
   udisks_drive_ata_set_pm_supported (UDISKS_DRIVE_ATA (drive), !!pm_supported);
@@ -329,21 +461,31 @@ update_security (UDisksLinuxDriveAta *drive,
   guint16 word_90 = 0;
   guint16 word_128 = 0;
 
-  /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
-  word_82  = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
-  word_85  = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
-  word_89  = udisks_ata_identify_get_word (device->ata_identify_device_data, 89);
-  word_90  = udisks_ata_identify_get_word (device->ata_identify_device_data, 90);
-  word_128 = udisks_ata_identify_get_word (device->ata_identify_device_data, 128);
+  security_supported = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_SECURITY");
+  security_enabled = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_SECURITY_ENABLED");
+  erase_unit = g_udev_device_get_property_as_int (device->udev_device, "ID_ATA_FEATURE_SET_SECURITY_ERASE_UNIT_MIN");
+  enhanced_erase_unit = g_udev_device_get_property_as_int (device->udev_device, "ID_ATA_FEATURE_SET_SECURITY_ENHANCED_ERASE_UNIT_MIN");
+  frozen = g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA_FEATURE_SET_SECURITY_FROZEN");
 
-  security_supported  = word_82 & (1<<1);
-  security_enabled    = word_85 & (1<<1);
-  if (security_supported)
+  if (!g_udev_device_get_property_as_boolean (device->udev_device, "ID_ATA")
+      && device->ata_identify_device_data)
     {
-      erase_unit = (word_89 & 0xff) * 2;
-      enhanced_erase_unit = (word_90 & 0xff) * 2;
+      /* ATA8: 7.16 IDENTIFY DEVICE - ECh, PIO Data-In - Table 29 IDENTIFY DEVICE data */
+      word_82  = udisks_ata_identify_get_word (device->ata_identify_device_data, 82);
+      word_85  = udisks_ata_identify_get_word (device->ata_identify_device_data, 85);
+      word_89  = udisks_ata_identify_get_word (device->ata_identify_device_data, 89);
+      word_90  = udisks_ata_identify_get_word (device->ata_identify_device_data, 90);
+      word_128 = udisks_ata_identify_get_word (device->ata_identify_device_data, 128);
+
+      security_supported  = word_82 & (1<<1);
+      security_enabled    = word_85 & (1<<1);
+      if (security_supported)
+        {
+          erase_unit = (word_89 & 0xff) * 2;
+          enhanced_erase_unit = (word_90 & 0xff) * 2;
+        }
+      frozen = word_128 & (1<<3);
     }
-  frozen = word_128 & (1<<3);
 
   g_object_freeze_notify (G_OBJECT (drive));
   /* TODO: export Security{Supported,Enabled} properties
@@ -521,19 +663,27 @@ udisks_linux_drive_ata_refresh_smart_sync (UDisksLinuxDriveAta  *drive,
       guchar count;
       gboolean noio = FALSE;
       gboolean awake;
+      const gchar *smart_access;
+
+      smart_access = g_udev_device_get_property (device->udev_device, "ID_ATA_SMART_ACCESS");
+      if (g_strcmp0 (smart_access, "none") == 0)
+        {
+          /* FIXME: find a better error code */
+          g_set_error_literal (error, UDISKS_ERROR, UDISKS_ERROR_CANCELLED,
+                               "Refusing any I/O due to ID_ATA_SMART_ACCESS being set to 'none'");
+          goto out;
+        }
 
       if (drive->standby_enabled)
         noio = update_io_stats (drive, device);
       if (!udisks_ata_get_pm_state (g_udev_device_get_device_file (device->udev_device), error, &count))
         goto out;
       awake = count == 0xFF || count == 0x80;
-      /* don't wake up disk unless specically asked to */
+      /* don't wake up disk unless specifically asked to */
       if (nowakeup && (!awake || noio))
         {
-          g_set_error (error,
-                       UDISKS_ERROR,
-                       UDISKS_ERROR_WOULD_WAKEUP,
-                       "Disk is in sleep mode and the nowakeup option was passed");
+          g_set_error_literal (error, UDISKS_ERROR, UDISKS_ERROR_WOULD_WAKEUP,
+                               "Disk is in sleep mode and the nowakeup option was passed");
           goto out_io;
         }
 
@@ -551,12 +701,12 @@ udisks_linux_drive_ata_refresh_smart_sync (UDisksLinuxDriveAta  *drive,
       goto out;
     }
 
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   bd_smart_ata_free (drive->smart_data);
   drive->smart_data = data;
   drive->smart_is_from_blob = (simulate_path != NULL);
   drive->smart_updated = time (NULL);
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
 
   update_smart (drive, device);
 
@@ -704,10 +854,10 @@ handle_smart_update (UDisksDriveAta        *_drive,
   /* Translators: Shown in authentication dialog when the user
    * refreshes SMART data from a disk.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to update SMART data from $(drive)");
+  message = N_("Authentication is required to update SMART data from $(device.name)");
   action_id = "org.freedesktop.udisks2.ata-smart-update";
 
   if (atasmart_blob != NULL)
@@ -715,10 +865,10 @@ handle_smart_update (UDisksDriveAta        *_drive,
       /* Translators: Shown in authentication dialog when the user
        * tries to simulate SMART data from a libatasmart blob.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to set SMART data from a blob on $(drive)");
+      message = N_("Authentication is required to set SMART data from a blob on $(device.name)");
       action_id = "org.freedesktop.udisks2.ata-smart-simulate";
     }
   else
@@ -784,7 +934,7 @@ handle_smart_get_attributes (UDisksDriveAta        *_drive,
   GVariantBuilder builder;
   BDSmartATAAttribute **a;
 
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   if (drive->smart_data == NULL)
     {
       g_dbus_method_invocation_return_error (invocation,
@@ -818,7 +968,7 @@ handle_smart_get_attributes (UDisksDriveAta        *_drive,
       udisks_drive_ata_complete_smart_get_attributes (UDISKS_DRIVE_ATA (drive), invocation,
                                                       g_variant_builder_end (&builder));
     }
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
 
   return TRUE; /* returning TRUE means that we handled the method invocation */
 }
@@ -872,10 +1022,10 @@ handle_smart_selftest_abort (UDisksDriveAta        *_drive,
                                                     /* Translators: Shown in authentication dialog when the user
                                                      * aborts a running SMART self-test.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and
+                                                     * Do not translate $(device.name), it's a placeholder and
                                                      * will be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to abort a SMART self-test on $(drive)"),
+                                                    N_("Authentication is required to abort a SMART self-test on $(device.name)"),
                                                     invocation))
     goto out;
 
@@ -893,12 +1043,12 @@ handle_smart_selftest_abort (UDisksDriveAta        *_drive,
     }
 
   /* This wakes up the selftest thread */
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   if (drive->selftest_job != NULL)
     {
       g_cancellable_cancel (udisks_base_job_get_cancellable (UDISKS_BASE_JOB (drive->selftest_job)));
     }
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
   /* TODO: wait for the selftest thread to terminate */
 
   error = NULL;
@@ -962,10 +1112,10 @@ selftest_job_func (UDisksThreadedJob  *job,
 
       /* TODO: set estimation properties etc. on the Job object */
 
-      G_LOCK (object_lock);
+      g_mutex_lock (&drive->object_lock);
       still_in_progress = drive->smart_data && drive->smart_data->self_test_status == BD_SMART_ATA_SELF_TEST_STATUS_IN_PROGRESS;
       progress = (100.0 - (drive->smart_data ? drive->smart_data->self_test_percent_remaining : 0)) / 100.0;
-      G_UNLOCK (object_lock);
+      g_mutex_unlock (&drive->object_lock);
       if (!still_in_progress)
         {
           ret = TRUE;
@@ -1039,9 +1189,9 @@ selftest_job_func (UDisksThreadedJob  *job,
 
  out:
   /* terminate the job */
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   drive->selftest_job = NULL;
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
   g_clear_object (&object);
   return ret;
 }
@@ -1101,17 +1251,17 @@ handle_smart_selftest_start (UDisksDriveAta        *_drive,
       goto out;
     }
 
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   if (drive->selftest_job != NULL)
     {
       g_dbus_method_invocation_return_error (invocation,
                                              UDISKS_ERROR,
                                              UDISKS_ERROR_FAILED,
                                              "There is already SMART self-test running");
-      G_UNLOCK (object_lock);
+      g_mutex_unlock (&drive->object_lock);
       goto out;
     }
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
 
   if (!udisks_daemon_util_check_authorization_sync (daemon,
                                                     UDISKS_OBJECT (block_object),
@@ -1120,10 +1270,10 @@ handle_smart_selftest_start (UDisksDriveAta        *_drive,
                                                     /* Translators: Shown in authentication dialog when the user
                                                      * initiates a SMART self-test.
                                                      *
-                                                     * Do not translate $(drive), it's a placeholder and
+                                                     * Do not translate $(device.name), it's a placeholder and
                                                      * will be replaced by the name of the drive/device in question
                                                      */
-                                                    N_("Authentication is required to start a SMART self-test on $(drive)"),
+                                                    N_("Authentication is required to start a SMART self-test on $(device.name)"),
                                                     invocation))
     goto out;
 
@@ -1140,19 +1290,20 @@ handle_smart_selftest_start (UDisksDriveAta        *_drive,
       goto out;
     }
 
-  G_LOCK (object_lock);
+  g_mutex_lock (&drive->object_lock);
   if (drive->selftest_job == NULL)
     {
       drive->selftest_job = UDISKS_THREADED_JOB (udisks_daemon_launch_threaded_job (daemon,
                                                                                     UDISKS_OBJECT (object),
                                                                                     "ata-smart-selftest", caller_uid,
+                                                                                    FALSE,
                                                                                     selftest_job_func,
                                                                                     g_object_ref (drive),
                                                                                     g_object_unref,
                                                                                     NULL)); /* GCancellable */
       udisks_threaded_job_start (drive->selftest_job);
     }
-  G_UNLOCK (object_lock);
+  g_mutex_unlock (&drive->object_lock);
 
   udisks_drive_ata_complete_smart_selftest_start (UDISKS_DRIVE_ATA (drive), invocation);
 
@@ -1215,20 +1366,20 @@ handle_smart_set_enabled (UDisksDriveAta        *_drive,
       /* Translators: Shown in authentication dialog when the user
        * requests enabling SMART on a disk.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to enable SMART on $(drive)");
+      message = N_("Authentication is required to enable SMART on $(device.name)");
     }
   else
     {
       /* Translators: Shown in authentication dialog when the user
        * requests enabling SMART on a disk.
        *
-       * Do not translate $(drive), it's a placeholder and
+       * Do not translate $(device.name), it's a placeholder and
        * will be replaced by the name of the drive/device in question
        */
-      message = N_("Authentication is required to disable SMART on $(drive)");
+      message = N_("Authentication is required to disable SMART on $(device.name)");
     }
   action_id = "org.freedesktop.udisks2.ata-smart-enable-disable";
 
@@ -1305,6 +1456,9 @@ handle_smart_set_enabled (UDisksDriveAta        *_drive,
           goto out;
         }
     }
+
+  udisks_linux_block_object_trigger_uevent_sync (UDISKS_LINUX_BLOCK_OBJECT (block_object),
+                                                 UDISKS_DEFAULT_WAIT_TIMEOUT);
 
   /* Reread new IDENTIFY data */
   if (!udisks_linux_device_reprobe_sync (device,
@@ -1445,10 +1599,10 @@ handle_pm_get_state (UDisksDriveAta        *_drive,
   /* Translators: Shown in authentication dialog when the user
    * requests the power state of a drive.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to check power state for $(drive)");
+  message = N_("Authentication is required to check power state for $(device.name)");
   action_id = "org.freedesktop.udisks2.ata-check-power";
 
   /* TODO: maybe not check with polkit if this is OK (consider gnome-disks(1) polling all drives every few seconds) */
@@ -1541,11 +1695,11 @@ handle_pm_standby_wakeup (UDisksDriveAta        *_drive,
    * tries to wake up a drive from standby mode or tries to put a drive into
    * standby mode.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = (do_wakeup) ? N_("Authentication is required to wake up $(drive) from standby mode") :
-                          N_("Authentication is required to put $(drive) in standby mode");
+  message = (do_wakeup) ? N_("Authentication is required to wake up $(device.name) from standby mode") :
+                          N_("Authentication is required to put $(device.name) in standby mode");
   action_id = "org.freedesktop.udisks2.ata-standby";
   if (udisks_block_get_hint_system (block))
     {
@@ -1735,7 +1889,7 @@ apply_configuration_thread_func (GTask        *task,
                  udisks_config_manager_get_config_dir (udisks_daemon_get_config_manager (daemon)),
                  udisks_drive_get_id (data->drive), device_file);
 
-  /* Use O_RDRW instead of O_RDONLY to force a 'change' uevent so properties are updated */
+  /* Use O_RDWR instead of O_RDONLY to force a 'change' uevent so properties are updated */
   fd = open (device_file, O_RDWR|O_NONBLOCK);
   if (fd == -1)
     {
@@ -1983,7 +2137,10 @@ on_secure_erase_update_progress_timeout (gpointer user_data)
   start = udisks_job_get_start_time (job);
   end = udisks_job_get_expected_end_time (job);
 
-  progress = ((gdouble) (now - start)) / (end - start);
+  if (end <= start)
+    progress = 0;
+  else
+    progress = ((gdouble) (now - start)) / (end - start);
   if (progress < 0)
     progress = 0;
   if (progress > 1)
@@ -2175,7 +2332,7 @@ udisks_linux_drive_ata_secure_erase_sync (UDisksLinuxDriveAta  *drive,
   job = udisks_daemon_launch_simple_job (daemon,
                                          UDISKS_OBJECT (object),
                                          enhanced ? "ata-enhanced-secure-erase" : "ata-secure-erase",
-                                         caller_uid, NULL);
+                                         caller_uid, FALSE, NULL);
   udisks_job_set_cancelable (UDISKS_JOB (job), FALSE);
 
   /* A value of 510 (255 in the IDENTIFY DATA register) means "erase
@@ -2402,10 +2559,10 @@ handle_security_erase_unit (UDisksDriveAta        *_drive,
   /* Translators: Shown in authentication dialog when the user
    * requests erasing a hard disk using the SECURE ERASE UNIT command.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to perform a secure erase of $(drive)");
+  message = N_("Authentication is required to perform a secure erase of $(device.name)");
   action_id = "org.freedesktop.udisks2.ata-secure-erase";
 
   /* Check that the user is authorized */
@@ -2432,6 +2589,8 @@ handle_security_erase_unit (UDisksDriveAta        *_drive,
 
   udisks_linux_block_object_trigger_uevent_sync (UDISKS_LINUX_BLOCK_OBJECT (block_object),
                                                  UDISKS_DEFAULT_WAIT_TIMEOUT);
+
+  udisks_drive_ata_complete_security_erase_unit (_drive, invocation);
 
  out:
   g_clear_object (&block_object);

@@ -4,7 +4,8 @@ import subprocess
 import os
 import time
 import re
-import sys
+import shutil
+import multiprocessing
 from datetime import datetime
 from enum import Enum
 from systemd import journal
@@ -16,6 +17,8 @@ from gi.repository import GUdev
 
 test_devs = None
 FLIGHT_RECORD_FILE = "flight_record.log"
+
+multiprocessing.set_start_method("fork")
 
 
 def run_command(command):
@@ -127,7 +130,7 @@ class DBusProperty(object):
 
         return False
 
-    def assertEqual(self, value, timeout=TIMEOUT, getter=None, poll_vg=None):
+    def assertEqual(self, value, timeout=TIMEOUT, getter=None, poll_vg=None, msg=None):
         if getter is not None:
             check_fn = lambda x: getter(x) == value
         else:
@@ -136,11 +139,11 @@ class DBusProperty(object):
 
         if not ret:
             if getter is not None:
-                raise AssertionError('%s != %s' % (getter(self._value), value))
+                raise AssertionError('%s != %s%s' % (getter(self._value), value, ' (%s)' % msg if msg else ''))
             else:
-                raise AssertionError('%s != %s' % (self._value, value))
+                raise AssertionError('%s != %s%s' % (self._value, value, ' (%s)' % msg if msg else ''))
 
-    def assertNotEqual(self, value, timeout=TIMEOUT, getter=None):
+    def assertNotEqual(self, value, timeout=TIMEOUT, getter=None, msg=None):
         if getter is not None:
             check_fn = lambda x: getter(x) != value
         else:
@@ -149,9 +152,9 @@ class DBusProperty(object):
 
         if not ret:
             if getter is not None:
-                raise AssertionError('%s == %s' % (getter(self._value), value))
+                raise AssertionError('%s != %s%s' % (getter(self._value), value, ' (%s)' % msg if msg else ''))
             else:
-                raise AssertionError('%s == %s' % (self._value, value))
+                raise AssertionError('%s != %s%s' % (self._value, value, ' (%s)' % msg if msg else ''))
 
     def assertAlmostEqual(self, value, delta, timeout=TIMEOUT, getter=None):
         if getter is not None:
@@ -168,47 +171,47 @@ class DBusProperty(object):
                 raise AssertionError('%s is not almost equal to %s (delta = %s)' % (self._value,
                                                                                     value, delta))
 
-    def assertGreater(self, value, timeout=TIMEOUT):
+    def assertGreater(self, value, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: x > value
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s is not greater than %s' % (self._value, value))
+            raise AssertionError('%s is not greater than %s%s' % (self._value, value, ' (%s)' % msg if msg else ''))
 
-    def assertLess(self, value, timeout=TIMEOUT):
+    def assertLess(self, value, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: x < value
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s is not less than %s' % (self._value, value))
+            raise AssertionError('%s is not less than %s%s' % (self._value, value, ' (%s)' % msg if msg else ''))
 
-    def assertIn(self, lst, timeout=TIMEOUT):
+    def assertIn(self, lst, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: x in lst
         ret = self._check(timeout, check_fn)
 
         if not ret:
             raise AssertionError('%s not found in %s' % (self._value, lst))
 
-    def assertNotIn(self, lst, timeout=TIMEOUT):
+    def assertNotIn(self, lst, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: x not in lst
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s unexpectedly found in %s' % (self._value, lst))
+            raise AssertionError('%s unexpectedly found in %s%s' % (self._value, lst, ' (%s)' % msg if msg else ''))
 
-    def assertTrue(self, timeout=TIMEOUT):
+    def assertTrue(self, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: bool(x)
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s is not true' % self._value)
+            raise AssertionError('%s is not true%s' % (self._value, ' (%s)' % msg if msg else ''))
 
-    def assertFalse(self, timeout=TIMEOUT):
+    def assertFalse(self, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: not bool(x)
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s is not false' % self._value)
+            raise AssertionError('%s is not false%s' % (self._value, ' (%s)' % msg if msg else ''))
 
     def assertIsNone(self, timeout=TIMEOUT):
         check_fn = lambda x: x is None
@@ -217,14 +220,14 @@ class DBusProperty(object):
         if not ret:
             raise AssertionError('%s is not None' % self._value)
 
-    def assertIsNotNone(self, timeout=TIMEOUT):
+    def assertIsNotNone(self, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: x is not None
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('unexpectedly None')
+            raise AssertionError('unexpectedly None%s' % (' (%s)' % msg if msg else ''))
 
-    def assertLen(self, length, timeout=TIMEOUT):
+    def assertLen(self, length, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: len(x) == length
         ret = self._check(timeout, check_fn)
 
@@ -232,22 +235,25 @@ class DBusProperty(object):
             if not hasattr(self._value, '__len__'):
                 raise AssertionError('%s has no length' % type(self._value))
             else:
-                raise AssertionError('Expected length %d, but %s has length %d' % (length,
-                                                                                   self._value,
-                                                                                   len(self._value)))
-    def assertContains(self, member, timeout=TIMEOUT):
+                raise AssertionError('Expected length %d, but %s has length %d%s' % (length,
+                                                                                     self._value,
+                                                                                     len(self._value),
+                                                                                     ' (%s)' % msg if msg else ''))
+    def assertContains(self, member, timeout=TIMEOUT, msg=None):
         check_fn = lambda x: member in x
         ret = self._check(timeout, check_fn)
 
         if not ret:
-            raise AssertionError('%s does not contain %s' % (self._value, member))
+            raise AssertionError('%s does not contain %s%s' % (self._value, member, ' (%s)' % msg if msg else ''))
 
 
 class UdisksTestCase(unittest.TestCase):
+    TIMEOUT = 5
+
     iface_prefix = None
     path_prefix = None
     bus = None
-    vdevs = None
+    vdevs = []
     distro = (None, None, None)       # (project, distro_name, version)
     no_options = dbus.Dictionary(signature="sv")
 
@@ -298,7 +304,7 @@ class UdisksTestCase(unittest.TestCase):
         try:
             # self.iface_prefix is the same as the DBus name we acquire
             obj = self.bus.get_object(self.iface_prefix, path)
-        except:
+        except Exception:
             obj = None
         return obj
 
@@ -365,6 +371,18 @@ class UdisksTestCase(unittest.TestCase):
             time.sleep(0.5)
         self.fail('Failed to unmount %s: %s' % (path, out))
 
+    def _conf_backup(self, conf_file):
+        """ Backup and restore @conf_file during cleanup. If @conf_file doesn't exist, it
+            will be removed during cleanup
+        """
+        if os.path.exists(conf_file):
+            # conf file exists -> backup and restore
+            contents = self.read_file(conf_file)
+            self.addCleanup(self.write_file, conf_file, contents)
+        else:
+            # conf file doesn't exist -> remove during cleanup
+            self.addCleanup(shutil.rmtree, conf_file, True)
+
     @classmethod
     def read_file(self, filename):
         with open(filename, 'r') as f:
@@ -409,7 +427,7 @@ class UdisksTestCase(unittest.TestCase):
             manager.EnableModule(module, dbus.Boolean(True))
             return True
         except dbus.exceptions.DBusException as e:
-            msg = r"Error initializing module '%s': .*\.so: cannot open shared object file: No such file or directory" % module
+            msg = r"Error initializing module '%s': Module not available: " % module
             if re.search(msg, e.get_dbus_message()):
                 return False
             else:
@@ -474,8 +492,8 @@ class UdisksTestCase(unittest.TestCase):
         time.sleep(1)
 
     @classmethod
-    def assertHasIface(self, obj, iface):
-        for _ in range(20):
+    def assertHasIface(self, obj, iface, timeout=TIMEOUT):
+        for _ in range(timeout * 2):
             obj_intro = dbus.Interface(obj, "org.freedesktop.DBus.Introspectable")
             intro_data = obj_intro.Introspect()
             if 'interface name="%s"' % iface in intro_data:
@@ -483,6 +501,17 @@ class UdisksTestCase(unittest.TestCase):
             time.sleep(0.5)
 
         raise AssertionError("Object '%s' has no interface '%s'" % (obj.object_path, iface))
+
+    def assertObjNotOnBus(self, obj_path, timeout=TIMEOUT):
+        objects = []
+        for _ in range(timeout * 2):
+            obj_mgr = self.get_object('')
+            objects = obj_mgr.GetManagedObjects(dbus_interface='org.freedesktop.DBus.ObjectManager')
+            if obj_path not in objects.keys():
+                return
+            time.sleep(0.5)
+
+        raise AssertionError("Object '%s' present on the object manager" % (obj_path))
 
     def assertStartswith(self, val, prefix):
         if not val.startswith(prefix):

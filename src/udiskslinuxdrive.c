@@ -583,7 +583,9 @@ set_rotation_rate (UDisksDrive       *iface,
   else
     {
       rate = -1;
-      if (device->ata_identify_device_data != NULL)
+      if (g_udev_device_has_property (device->udev_device, "ID_ATA_ROTATION_RATE_RPM"))
+        rate = g_udev_device_get_property_as_int (device->udev_device, "ID_ATA_ROTATION_RATE_RPM");
+      else if (device->ata_identify_device_data != NULL)
         {
           guint word_217 = 0;
 
@@ -725,7 +727,7 @@ append_fixedup_sd (const gchar *prefix,
     ;
   str = g_string_new (prefix);
   g_string_append (str, "sd");
-  for (n = 0; n < 5 - num_alphas; n++)
+  for (n = num_alphas; n < 5; n++)
     g_string_append_c (str, '_');
 
   g_string_append (str, device_name + 2);
@@ -1045,8 +1047,7 @@ udisks_linux_drive_update (UDisksLinuxDrive       *drive,
 
  out:
   g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (drive));
-  if (device != NULL)
-    g_clear_object (&device);
+  g_clear_object (&device);
 
   return ret;
 }
@@ -1112,10 +1113,10 @@ handle_eject (UDisksDrive           *_drive,
   /* Translators: Shown in authentication dialog when the user
    * requests ejecting media from a drive.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to eject $(drive)");
+  message = N_("Authentication is required to eject $(device.name)");
   action_id = "org.freedesktop.udisks2.eject-media";
   if (udisks_block_get_hint_system (block))
     {
@@ -1140,6 +1141,7 @@ handle_eject (UDisksDrive           *_drive,
   if (!udisks_daemon_launch_spawned_job_sync (daemon,
                                               UDISKS_OBJECT (object),
                                               "drive-eject", caller_uid,
+                                              FALSE,
                                               NULL, /* GCancellable */
                                               0,    /* uid_t run_as_uid */
                                               0,    /* uid_t run_as_euid */
@@ -1200,10 +1202,10 @@ handle_set_configuration (UDisksDrive           *_drive,
   /* Translators: Shown in authentication dialog when the user
    * changes settings for a drive.
    *
-   * Do not translate $(drive), it's a placeholder and will be
+   * Do not translate $(device.name), it's a placeholder and will be
    * replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to configure settings for $(drive)");
+  message = N_("Authentication is required to configure settings for $(device.name)");
   action_id = "org.freedesktop.udisks2.modify-drive-settings";
 
   /* Check that the user is actually authorized */
@@ -1267,6 +1269,7 @@ handle_set_configuration (UDisksDrive           *_drive,
             {
               g_assert_not_reached ();
             }
+          g_variant_unref (value);
         }
     }
 
@@ -1515,10 +1518,10 @@ handle_power_off (UDisksDrive           *_drive,
   /* Translators: Shown in authentication dialog when the user
    * requests ejecting media from a drive.
    *
-   * Do not translate $(drive), it's a placeholder and
+   * Do not translate $(device.name), it's a placeholder and
    * will be replaced by the name of the drive/device in question
    */
-  message = N_("Authentication is required to power off $(drive)");
+  message = N_("Authentication is required to power off $(device.name)");
   action_id = "org.freedesktop.udisks2.power-off-drive";
   if (udisks_block_get_hint_system (block))
     {
@@ -1560,7 +1563,7 @@ handle_power_off (UDisksDrive           *_drive,
           g_dbus_method_invocation_return_error (invocation,
                                                  UDISKS_ERROR,
                                                  UDISKS_ERROR_FAILED,
-                                                 "Error syncing  %s: %m",
+                                                 "Error syncing %s: %m",
                                                  device_file);
           close (device_fd);
           goto out;

@@ -212,11 +212,9 @@ handle_delete (UDisksLoop            *loop,
   udisks_linux_block_object_lock_for_cleanup (UDISKS_LINUX_BLOCK_OBJECT (object));
   udisks_state_check_block (state, udisks_linux_block_object_get_device_number (UDISKS_LINUX_BLOCK_OBJECT (object)));
 
-  error = NULL;
   if (!udisks_daemon_util_get_caller_uid_sync (daemon, invocation, NULL, &caller_uid, &error))
     {
-      g_dbus_method_invocation_return_gerror (invocation, error);
-      g_clear_error (&error);
+      g_dbus_method_invocation_take_error (invocation, error);
       goto out;
     }
 
@@ -237,10 +235,10 @@ handle_delete (UDisksLoop            *loop,
                                                          * requests deleting a loop device previously set up by
                                                          * another user.
                                                          *
-                                                         * Do not translate $(drive), it's a placeholder and
+                                                         * Do not translate $(device.name), it's a placeholder and
                                                          * will be replaced by the name of the drive/device in question
                                                          */
-                                                        N_("Authentication is required to delete the loop device $(drive)"),
+                                                        N_("Authentication is required to delete the loop device $(device.name)"),
                                                         invocation))
         goto out;
     }
@@ -249,6 +247,7 @@ handle_delete (UDisksLoop            *loop,
                                          UDISKS_OBJECT(object),
                                          "loop-setup",
                                          caller_uid,
+                                         FALSE,
                                          NULL);
 
   if (job == NULL)
@@ -312,11 +311,80 @@ handle_set_autoclear (UDisksLoop             *loop,
 
   daemon = udisks_linux_block_object_get_daemon (UDISKS_LINUX_BLOCK_OBJECT (object));
 
-  error = NULL;
   if (!udisks_daemon_util_get_caller_uid_sync (daemon, invocation, NULL, &caller_uid, &error))
     {
-      g_dbus_method_invocation_return_gerror (invocation, error);
-      g_clear_error (&error);
+      g_dbus_method_invocation_take_error (invocation, error);
+      goto out;
+    }
+
+  if (!udisks_daemon_util_setup_by_user (daemon, object, caller_uid))
+    {
+      if (!udisks_daemon_util_check_authorization_sync (daemon,
+                                                        object,
+                                                        "org.freedesktop.udisks2.loop-modify-others",
+                                                        options,
+                                                        /* Translators: Shown in authentication dialog when the user
+                                                         * requests changing autoclear on a loop device set up by
+                                                         * another user.
+                                                         *
+                                                         * Do not translate $(device.name), it's a placeholder and
+                                                         * will be replaced by the name of the drive/device in question
+                                                         */
+                                                        N_("Authentication is required to modify the loop device $(device.name)"),
+                                                        invocation))
+        goto out;
+    }
+
+  device = udisks_linux_block_object_get_device (UDISKS_LINUX_BLOCK_OBJECT (object));
+  device_file = g_udev_device_get_device_file (device->udev_device);
+  if (!bd_loop_set_autoclear (device_file, arg_value, &error))
+    {
+      g_dbus_method_invocation_take_error (invocation, error);
+      goto out;
+    }
+
+  /* speculatively update our local value so a change signal is emitted before we return... */
+  udisks_loop_set_autoclear (UDISKS_LOOP (loop), arg_value);
+  g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (loop));
+
+  /* ... but make sure we update the property value from sysfs */
+  udisks_linux_block_object_trigger_uevent_sync (UDISKS_LINUX_BLOCK_OBJECT (object),
+                                                 UDISKS_DEFAULT_WAIT_TIMEOUT);
+
+  udisks_loop_complete_set_autoclear (loop, invocation);
+
+ out:
+  g_clear_object (&device);
+  g_clear_object (&object);
+
+  return TRUE; /* returning TRUE means that we handled the method invocation */
+}
+
+/* runs in thread dedicated to handling @invocation */
+static gboolean
+handle_set_capacity (UDisksLoop             *loop,
+                     GDBusMethodInvocation  *invocation,
+                     GVariant               *options)
+{
+  UDisksObject *object = NULL;
+  UDisksDaemon *daemon = NULL;
+  UDisksLinuxDevice *device = NULL;
+  const gchar *device_file = NULL;
+  GError *error = NULL;
+  uid_t caller_uid = -1;
+
+  object = udisks_daemon_util_dup_object (loop, &error);
+  if (object == NULL)
+    {
+      g_dbus_method_invocation_take_error (invocation, error);
+      goto out;
+    }
+
+  daemon = udisks_linux_block_object_get_daemon (UDISKS_LINUX_BLOCK_OBJECT (object));
+
+  if (!udisks_daemon_util_get_caller_uid_sync (daemon, invocation, NULL, &caller_uid, &error))
+    {
+      g_dbus_method_invocation_take_error (invocation, error);
       goto out;
     }
 
@@ -340,22 +408,16 @@ handle_set_autoclear (UDisksLoop             *loop,
 
   device = udisks_linux_block_object_get_device (UDISKS_LINUX_BLOCK_OBJECT (object));
   device_file = g_udev_device_get_device_file (device->udev_device);
-  error = NULL;
-  if (!bd_loop_set_autoclear (device_file, arg_value, &error))
+  if (!bd_loop_set_capacity (device_file, &error))
     {
       g_dbus_method_invocation_take_error (invocation, error);
       goto out;
     }
 
-  /* specutatively update our local value so a change signal is emitted before we return... */
-  udisks_loop_set_autoclear (UDISKS_LOOP (loop), arg_value);
-  g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (loop));
-
-  /* ... but make sure we update the property value from sysfs */
   udisks_linux_block_object_trigger_uevent_sync (UDISKS_LINUX_BLOCK_OBJECT (object),
                                                  UDISKS_DEFAULT_WAIT_TIMEOUT);
 
-  udisks_loop_complete_set_autoclear (loop, invocation);
+  udisks_loop_complete_set_capacity (loop, invocation);
 
  out:
   g_clear_object (&device);
@@ -371,4 +433,5 @@ loop_iface_init (UDisksLoopIface *iface)
 {
   iface->handle_delete        = handle_delete;
   iface->handle_set_autoclear = handle_set_autoclear;
+  iface->handle_set_capacity  = handle_set_capacity;
 }
